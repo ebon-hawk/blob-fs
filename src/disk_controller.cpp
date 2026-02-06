@@ -1,23 +1,29 @@
-#include <unordered_map>
+#include <stdexcept>
 
 #include "disk_controller.hpp"
 
-namespace {
-    constexpr size_t CACHE_CAPACITY = 100;
+const size_t DiskController::CACHE_CAPACITY = 100;
 
-    struct CacheNode {
-        Specs::Inode node;
-        std::list<int32_t>::iterator it;
-    };
+void DiskController::loadBitmaps(std::fstream& fs, const Specs::Superblock& sb) {
+    inodeBitmap.resize((sb.inodeCount / 8) + 1);
 
-    std::unordered_map<int32_t, CacheNode> inodeCache;
+    fs.seekg(sb.inodeBitmapOffset, std::ios::beg);
 
-    // Stores inode indices, most recent at the front
-    std::list<int32_t> lruList;
+    if (!fs.read(reinterpret_cast<char*>(inodeBitmap.data()), inodeBitmap.size())) {
+        throw std::runtime_error("Failed to read inode bitmap from disk.");
+    }
+
+    dataBitmap.resize((sb.dataBlockCount / 8) + 1);
+    fs.seekg(sb.blockBitmapOffset, std::ios::beg);
+
+    if (!fs.read(reinterpret_cast<char*>(dataBitmap.data()), dataBitmap.size())) {
+        throw std::runtime_error("Failed to read data bitmap from disk.");
+    }
 }
 
-Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx) {
-    std::unordered_map<int32_t, CacheNode>::iterator it = inodeCache.find(idx);
+Specs::Inode DiskController::getInode(std::fstream& fs,
+    const Specs::Superblock& sb, int32_t idx) {
+    std::unordered_map<int32_t, CacheEntry>::iterator it = inodeCache.find(idx);
 
     // Cache hit
     if (inodeCache.end() != it) {
@@ -37,17 +43,12 @@ Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx
     Specs::Inode node = readInode(fs, sb, idx);
 
     // If cache is full, evict the least recently used (back of the list)
-    if (CACHE_CAPACITY <= inodeCache.size()) {
-        int32_t lastIdx = lruList.back();
-        lruList.pop_back();
-
-        inodeCache.erase(lastIdx);
-    }
+    enforceCacheLimit();
 
     // Add new entry to the front
     lruList.push_front(idx);
 
-    CacheNode newNode;
+    CacheEntry newNode;
     newNode.it = lruList.begin();
     newNode.node = node;
 
@@ -56,33 +57,70 @@ Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx
     return node;
 }
 
-void updateInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx, const Specs::Inode& node) {
+void DiskController::freeInode(std::fstream& fs,
+    const Specs::Superblock& sb, int32_t idx) {
+    // Fetch the inode to find its block pointers
+    Specs::Inode node = getInode(fs, sb, idx);
+
+    // Mark direct blocks as available in the RAM vector
+    for (int32_t i = 0; i < 32; ++i) {
+        freeBlock(node.directBlocks[i]);
+    }
+
+    // Handle indirect blocks
+    if (node.indirectBlock != Specs::NULL_INDEX) {
+        uint32_t pointersPerBlock = sb.blockSize / sizeof(int32_t);
+
+        std::vector<int32_t> indirectBuffer(pointersPerBlock);
+
+        readBlock(fs, sb, node.indirectBlock, reinterpret_cast<char*>(indirectBuffer.data()));
+
+        for (uint32_t i = 0; i < (int32_t)pointersPerBlock; ++i) {
+            freeBlock(indirectBuffer[i]);
+        }
+
+        // Mark the block that held the pointers as available
+        freeBlock(node.indirectBlock);
+    }
+
+    // Mark the inode itself as available in the RAM vector
+    inodeBitmap[idx / 8] &= ~(1 << (idx % 8));
+
+    // We do NOT sync here; we let the driver decide when to commit to disk
+    inodeBitmapDirty = true;
+
+    // LRU eviction
+    std::unordered_map<int32_t, CacheEntry>::iterator it = inodeCache.find(idx);
+
+    if (inodeCache.end() != it) {
+        lruList.erase(it->second.it);
+
+        inodeCache.erase(it);
+    }
+}
+
+void DiskController::updateInode(std::fstream& fs, const Specs::Superblock& sb,
+    int32_t idx, const Specs::Inode& node) {
     // Always persist to disk first
     writeInode(fs, sb, idx, node);
 
     // Synchronize the cache
-    std::unordered_map<int32_t, CacheNode>::iterator it = inodeCache.find(idx);
+    std::unordered_map<int32_t, CacheEntry>::iterator it = inodeCache.find(idx);
 
+    // If it exists in cache, update the data and move it to the front
     if (inodeCache.end() != it) {
-        // If it exists in cache, update the data and move it to the front
         it->second.node = node;
         lruList.erase(it->second.it);
         lruList.push_front(idx);
 
         it->second.it = lruList.begin();
     }
+    // If it doesn't exist in cache, just add it as the most recently used
     else {
-        // If it doesn't exist in cache, just add it as the most recently used
-        if (CACHE_CAPACITY <= inodeCache.size()) {
-            int32_t lastIdx = lruList.back();
-            lruList.pop_back();
-
-            inodeCache.erase(lastIdx);
-        }
-
+        enforceCacheLimit();
         lruList.push_front(idx);
 
-        CacheNode newNode;
+        CacheEntry newNode;
         newNode.it = lruList.begin();
         newNode.node = node;
 
@@ -90,85 +128,68 @@ void updateInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx, con
     }
 }
 
-int32_t findFreeInode(std::fstream& fs, const Specs::Superblock& sb) {
-    uint32_t bitmapSize = (sb.inodeCount / 8) + 1;
+int32_t DiskController::allocateBlock(std::fstream& fs, const Specs::Superblock& sb) {
+    for (uint32_t i = 0; i < sb.dataBlockCount; ++i) {
+        uint32_t byteIdx = i / 8;
 
-    std::vector<uint8_t> bitmap(bitmapSize);
+        uint32_t bitIdx = i % 8;
 
-    // Read the inode bitmap into RAM
-    fs.seekg(sb.inodeBitmapOffset, std::ios::beg);
+        if (!(dataBitmap[byteIdx] & (1 << bitIdx))) {
+            dataBitmap[byteIdx] |= (1 << bitIdx);
 
-    fs.read(reinterpret_cast<char*>(bitmap.data()), bitmapSize);
+            // Mark it as dirty (no disk I/O yet)
+            dataBitmapDirty = true;
 
+            return (int32_t)i;
+        }
+    }
+
+    return Specs::NULL_INDEX;
+}
+
+int32_t DiskController::allocateInode(std::fstream& fs, const Specs::Superblock& sb) {
     for (uint32_t i = 0; i < sb.inodeCount; ++i) {
         uint32_t byteIdx = i / 8;
 
         uint32_t bitIdx = i % 8;
 
         // Check if free
-        if (!(bitmap[byteIdx] & (1 << bitIdx))) {
+        if (!(inodeBitmap[byteIdx] & (1 << bitIdx))) {
             // Mark as used
-            bitmap[byteIdx] |= (1 << bitIdx);
+            inodeBitmap[byteIdx] |= (1 << bitIdx);
 
-            // Write bitmap back to disk immediately
-            fs.seekp(sb.inodeBitmapOffset, std::ios::beg);
-            fs.write(reinterpret_cast<char*>(bitmap.data()), bitmapSize);
+            // Mark it as dirty (no disk I/O yet)
+            inodeBitmapDirty = true;
 
             return (int32_t)i;
         }
     }
 
-    return -1;
+    return Specs::NULL_INDEX;
 }
 
-int32_t findFreeBlock(std::fstream& fs, Specs::Superblock& sb) {
-    uint32_t numBlocks = sb.maxFileSize / sb.blockSize;
-    uint32_t bitmapSize = (numBlocks / 8) + 1;
-    std::vector<uint8_t> bitmap(bitmapSize);
-    fs.seekg(sb.blockBitmapOffset, std::ios::beg);
-    fs.read(reinterpret_cast<char*>(bitmap.data()), bitmapSize);
-
-    for (uint32_t i = 0; i < numBlocks; ++i) {
-        uint32_t byteIdx = i / 8;
-
-        uint32_t bitIdx = i % 8;
-
-        if (!(bitmap[byteIdx] & (1 << bitIdx))) {
-            // Mark as used
-            bitmap[byteIdx] |= (1 << bitIdx);
-
-            // Write bitmap back to disk immediately
-            fs.seekp(sb.blockBitmapOffset, std::ios::beg);
-            fs.write(reinterpret_cast<char*>(bitmap.data()), bitmapSize);
-
-            return (int32_t)i;
-        }
+void DiskController::sync(std::fstream& fs, const Specs::Superblock& sb) {
+    if (inodeBitmapDirty) {
+        fs.seekp(sb.inodeBitmapOffset, std::ios::beg);
+        fs.write(reinterpret_cast<const char*>(inodeBitmap.data()), inodeBitmap.size());
+        inodeBitmapDirty = false;
     }
 
-    return -1;
-}
+    if (dataBitmapDirty) {
+        fs.seekp(sb.blockBitmapOffset, std::ios::beg);
+        fs.write(reinterpret_cast<const char*>(dataBitmap.data()), dataBitmap.size());
 
-Specs::Inode readInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx) {
-    Specs::Inode node;
-    uint32_t offset = sb.inodeTableOffset + (idx * sizeof(Specs::Inode));
+        dataBitmapDirty = false;
+    }
 
-    fs.seekg(offset, std::ios::beg);
-
-    fs.read(reinterpret_cast<char*>(&node), sizeof(Specs::Inode));
-
-    return node;
-}
-
-void writeInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx, const Specs::Inode& node) {
-    uint32_t offset = sb.inodeTableOffset + (idx * sizeof(Specs::Inode));
-
-    fs.seekp(offset, std::ios::beg);
-    fs.write(reinterpret_cast<const char*>(&node), sizeof(Specs::Inode));
-
+    // Ensure the OS actually pushes the data to the physical drive
     fs.flush();
 }
 
-void readBlock(std::fstream& fs, const Specs::Superblock& sb, int32_t blockIdx, char* buffer) {
+void DiskController::readBlock(std::fstream& fs, const Specs::Superblock& sb,
+    int32_t blockIdx, char* buffer) {
+    if (blockIdx == Specs::NULL_INDEX) return;
+
     uint32_t offset = sb.dataRegionOffset + (blockIdx * sb.blockSize);
 
     fs.seekg(offset, std::ios::beg);
@@ -176,65 +197,53 @@ void readBlock(std::fstream& fs, const Specs::Superblock& sb, int32_t blockIdx, 
     fs.read(buffer, sb.blockSize);
 }
 
-void writeBlock(std::fstream& fs, const Specs::Superblock& sb, int32_t blockIdx, const char* buffer) {
+void DiskController::writeBlock(std::fstream& fs, const Specs::Superblock& sb,
+    int32_t blockIdx, const char* buffer) {
+    if (blockIdx == Specs::NULL_INDEX) return;
+
     uint32_t offset = sb.dataRegionOffset + (blockIdx * sb.blockSize);
 
     fs.seekp(offset, std::ios::beg);
     fs.write(buffer, sb.blockSize);
-
-    fs.flush();
 }
 
-Specs::Superblock initNewDisk(std::fstream& fs, uint64_t maxSize) {
-    Specs::Superblock sb;
-    sb.blockSize = Specs::BLOCK_SIZE;
-    sb.magicNumber = Specs::MAGIC_NUMBER;
+void DiskController::enforceCacheLimit() {
+    if (inodeCache.size() >= CACHE_CAPACITY) {
+        int32_t lastIdx = lruList.back();
+        lruList.pop_back();
 
-    // Estimate counts (20% for inodes, 80% for data)
-    sb.dataBlockCount = (0.8 * maxSize) / sb.blockSize;
-    sb.inodeCount = (0.2 * maxSize) / sizeof(Specs::Inode);
-
-    // Calculate offsets
-    sb.inodeBitmapOffset = sizeof(Specs::Superblock);
-
-    sb.blockBitmapOffset = sb.inodeBitmapOffset + (sb.inodeCount / 8) + 1;
-    sb.inodeTableOffset = sb.blockBitmapOffset + (sb.dataBlockCount / 8) + 1;
-
-    // Align data region to block size
-    sb.dataRegionOffset = ((sb.inodeTableOffset + (sb.inodeCount * sizeof(Specs::Inode)) + Specs::BLOCK_SIZE - 1) / Specs::BLOCK_SIZE) * Specs::BLOCK_SIZE;
-
-    // Write zeros to the file to "reserve" the space on the real disk
-    std::vector<char> empty(Specs::BLOCK_SIZE, 0);
-
-    for (uint64_t i = 0; i < maxSize; i += Specs::BLOCK_SIZE) {
-        fs.write(empty.data(), std::min((uint64_t)Specs::BLOCK_SIZE, maxSize - i));
+        inodeCache.erase(lastIdx);
     }
+}
 
-    // Create root inode at index 0
-    Specs::Inode root;
-    std::memset(&root, 0, sizeof(root));
-    std::strcpy(root.name, "/");
+void DiskController::freeBlock(int32_t blockIdx) {
+    if (blockIdx == Specs::NULL_INDEX) return;
 
-    root.isDirectory = 1;
-    root.parent = Specs::NULL_INDEX;
+    uint32_t byteIdx = blockIdx / 8;
 
-    root.firstChild = Specs::NULL_INDEX;
-    root.nextSibling = Specs::NULL_INDEX;
-    root.prevSibling = Specs::NULL_INDEX;
+    uint32_t bitIdx = blockIdx % 8;
 
-    // Write superblock and root
-    fs.seekp(0, std::ios::beg);
-    fs.write(reinterpret_cast<char*>(&sb), sizeof(sb));
+    // Flip the bit in the RAM-resident vector
+    dataBitmap[byteIdx] &= ~(1 << bitIdx);
+    dataBitmapDirty = true;
+}
 
-    // We can't use updateInode because the disk isn't "live" yet,
-    // so we call our raw write function
-    writeInode(fs, sb, 0, root);
+Specs::Inode DiskController::readInode(std::fstream& fs,
+    const Specs::Superblock& sb, int32_t idx) {
+    Specs::Inode node;
+    uint32_t offset = sb.inodeTableOffset + (idx * Specs::INODE_SIZE);
 
-    // Manually mark inode 0 as used in the bitmap
-    uint8_t firstByte = 0x01;
+    fs.seekg(offset, std::ios::beg);
 
-    fs.seekp(sb.inodeBitmapOffset, std::ios::beg);
-    fs.write(reinterpret_cast<char*>(&firstByte), 1);
+    fs.read(reinterpret_cast<char*>(&node), Specs::INODE_SIZE);
 
-    return sb;
+    return node;
+}
+
+void DiskController::writeInode(std::fstream& fs, const Specs::Superblock& sb,
+    int32_t idx, const Specs::Inode& node) {
+    uint32_t offset = sb.inodeTableOffset + (idx * Specs::INODE_SIZE);
+
+    fs.seekp(offset, std::ios::beg);
+    fs.write(reinterpret_cast<const char*>(&node), Specs::INODE_SIZE);
 }

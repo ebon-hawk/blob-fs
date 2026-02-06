@@ -1,5 +1,5 @@
-#ifndef FS_SPECS_HPP
-#define FS_SPECS_HPP
+#ifndef SPECS_HPP
+#define SPECS_HPP
 
 #include <cstdint>
 
@@ -15,27 +15,23 @@ namespace Specs {
         // Size of a single data block in bytes
         uint32_t blockSize;
 
-        // Maximum allowed size for a single file in bytes:
-        // (numberOfDirectBlocks + numberOfIndirectBlocks) * blockSize
+        // Maximum allowed size for a single file in bytes
         uint32_t maxFileSize;
 
         // The total capacity of the inode table
         uint32_t inodeCount;
 
         // The total number of data blocks available for file content;
-        // matches the number of bits in the block bitmap
+        // matches the number of bits in the data block bitmap
         uint32_t dataBlockCount;
 
-        // Byte offset where the inode usage bitmap starts:
-        // inodeBitmapSize = (inodeCount / 8)
+        // Byte offset where the inode usage bitmap starts
         uint32_t inodeBitmapOffset;
 
-        // Byte offset where the data block usage bitmap starts:
-        // blockBitmapSize = (dataBlockCount / 8)
+        // Byte offset where the data block usage bitmap starts
         uint32_t blockBitmapOffset;
 
-        // Byte offset where the array of inode structs begins:
-        // inodeTableSize = INODE_SIZE * inodeCount
+        // Byte offset where the array of inode structs begins
         uint32_t inodeTableOffset;
 
         // Byte offset where the raw file data storage begins
@@ -62,4 +58,4 @@ namespace Specs {
     static_assert(sizeof(Inode) == INODE_SIZE, "Inode must be exactly 256 bytes.");
 }
 
-#endif // FS_SPECS_HPP
+#endif // SPECS_HPP

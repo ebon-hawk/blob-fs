@@ -2,54 +2,68 @@
 #define DISK_CONTROLLER_HPP
 
 #include <fstream>
+#include <list>
+#include <unordered_map>
+#include <vector>
 
 #include "specs.hpp"
 
-/**
- * @brief Retrieves an inode from RAM cache if available, otherwise fetches from disk.
- * @return The requested inode.
- */
-Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
+class DiskController {
+public:
+    // Initialization
+    static Specs::Superblock initNewDisk(std::fstream& fs, uint64_t maxSize);
 
-/**
- * @brief Saves an inode to disk and updates its entry in the RAM cache.
- * @note Use this for all metadata changes (renaming, resizing, linking).
- */
-void updateInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx, const Specs::Inode& node);
+    void loadBitmaps(std::fstream& fs, const Specs::Superblock& sb);
 
-/**
- * @brief Scans the inode table for an unused slot (name[0] == '\0').
- * @return Index of available inode, or -1 if the table is full.
- */
-int32_t findFreeInode(std::fstream& fs, const Specs::Superblock& sb);
+    // Inode management (cached)
+    Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
 
-/**
- * @brief Scans the bitmap to find the first available 4KB data block.
- * @return Index of the free block, or -1 if the disk is full.
- */
-int32_t findFreeBlock(std::fstream& fs, Specs::Superblock& sb);
+    void freeInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
 
-/**
- * @brief Raw read of an inode from the disk's inode table.
- */
-Specs::Inode readInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
+    void updateInode(std::fstream& fs, const Specs::Superblock& sb,
+        int32_t idx, const Specs::Inode& node);
 
-/**
- * @brief Raw write of an inode to a specific index on disk.
- */
-void writeInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx, const Specs::Inode& node);
+    // Allocation (bitmap-based)
+    int32_t allocateBlock(std::fstream& fs, const Specs::Superblock& sb);
 
-/**
- * @brief Reads a raw 4KB block from the data region into a buffer.
- */
-void readBlock(std::fstream& fs, const Specs::Superblock& sb, int32_t blockIdx, char* buffer);
+    int32_t allocateInode(std::fstream& fs, const Specs::Superblock& sb);
 
-/**
- * @brief Writes a raw 4KB block from a buffer to the data region.
- */
-void writeBlock(std::fstream& fs, const Specs::Superblock& sb, int32_t blockIdx, const char* buffer);
+    void sync(std::fstream& fs, const Specs::Superblock& sb);
 
-// TODO: Write description
-Specs::Superblock initNewDisk(std::fstream& fs, uint64_t maxSize);
+    // Raw disk I/O
+    void readBlock(std::fstream& fs, const Specs::Superblock& sb,
+        int32_t blockIdx, char* buffer);
+
+    void writeBlock(std::fstream& fs, const Specs::Superblock& sb,
+        int32_t blockIdx, const char* buffer);
+
+private:
+    void enforceCacheLimit();
+
+    void freeBlock(int32_t blockIdx);
+
+    // Internal helpers for raw disk access
+    Specs::Inode readInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
+
+    void writeInode(std::fstream& fs, const Specs::Superblock& sb,
+        int32_t idx, const Specs::Inode& node);
+
+private:
+    static const size_t CACHE_CAPACITY;
+
+    struct CacheEntry {
+        Specs::Inode node;
+        std::list<int32_t>::iterator it;
+    };
+
+    std::unordered_map<int32_t, CacheEntry> inodeCache;
+    std::vector<uint8_t> dataBitmap;
+    std::vector<uint8_t> inodeBitmap;
+
+    std::list<int32_t> lruList;
+
+    bool dataBitmapDirty = false;
+    bool inodeBitmapDirty = false;
+};
 
 #endif // DISK_CONTROLLER_HPP
