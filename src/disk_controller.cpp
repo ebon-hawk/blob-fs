@@ -5,7 +5,7 @@
 const size_t DiskController::CACHE_CAPACITY = 100;
 
 void DiskController::loadBitmaps(std::fstream& fs, const Specs::Superblock& sb) {
-    inodeBitmap.resize((sb.inodeCount / 8) + 1);
+    inodeBitmap.resize(Specs::bitsToBytes(sb.inodeCount));
 
     fs.seekg(sb.inodeBitmapOffset, std::ios::beg);
 
@@ -13,7 +13,7 @@ void DiskController::loadBitmaps(std::fstream& fs, const Specs::Superblock& sb) 
         throw std::runtime_error("Failed to read inode bitmap from disk.");
     }
 
-    dataBitmap.resize((sb.dataBlockCount / 8) + 1);
+    dataBitmap.resize(Specs::bitsToBytes(sb.dataBlockCount));
     fs.seekg(sb.blockBitmapOffset, std::ios::beg);
 
     if (!fs.read(reinterpret_cast<char*>(dataBitmap.data()), dataBitmap.size())) {
@@ -43,12 +43,13 @@ Specs::Inode DiskController::getInode(std::fstream& fs,
     Specs::Inode node = readInode(fs, sb, idx);
 
     // If cache is full, evict the least recently used (back of the list)
-    enforceCacheLimit();
+    enforceCacheLimit(fs, sb);
 
     // Add new entry to the front
     lruList.push_front(idx);
 
     CacheEntry newNode;
+    newNode.dirty = false;
     newNode.it = lruList.begin();
     newNode.node = node;
 
@@ -62,26 +63,36 @@ void DiskController::freeInode(std::fstream& fs,
     // Fetch the inode to find its block pointers
     Specs::Inode node = getInode(fs, sb, idx);
 
-    // Mark direct blocks as available in the RAM vector
-    for (int32_t i = 0; i < 32; ++i) {
-        freeBlock(node.directBlocks[i]);
-    }
-
-    // Handle indirect blocks
-    if (node.indirectBlock != Specs::NULL_INDEX) {
-        uint32_t pointersPerBlock = sb.blockSize / sizeof(int32_t);
-
-        std::vector<int32_t> indirectBuffer(pointersPerBlock);
-
-        readBlock(fs, sb, node.indirectBlock, reinterpret_cast<char*>(indirectBuffer.data()));
-
-        for (uint32_t i = 0; i < (int32_t)pointersPerBlock; ++i) {
-            freeBlock(indirectBuffer[i]);
+    if (!node.isDirectory) {
+        // Mark direct blocks as available in the RAM vector
+        for (int32_t i = 0; i < 32; ++i) {
+            freeBlock(node.directBlocks[i]);
+            node.directBlocks[i] = Specs::NULL_INDEX;
         }
 
-        // Mark the block that held the pointers as available
-        freeBlock(node.indirectBlock);
+        // Handle indirect blocks
+        if (node.indirectBlock != Specs::NULL_INDEX) {
+            uint32_t pointersPerBlock = sb.blockSize / sizeof(int32_t);
+
+            std::vector<int32_t> indirectBuffer(pointersPerBlock);
+
+            readBlock(fs, sb, node.indirectBlock, reinterpret_cast<char*>(indirectBuffer.data()));
+
+            for (uint32_t i = 0; i < (int32_t)pointersPerBlock; ++i) {
+                freeBlock(indirectBuffer[i]);
+            }
+
+            // Mark the block that held the pointers as available
+            freeBlock(node.indirectBlock);
+            node.indirectBlock = Specs::NULL_INDEX;
+        }
     }
+
+    node.isDirectory = 0;
+    node.size = 0;
+
+    // Update the disk/cache with the now "clean" inode
+    updateInode(fs, sb, idx, node);
 
     // Mark the inode itself as available in the RAM vector
     inodeBitmap[idx / 8] &= ~(1 << (idx % 8));
@@ -101,9 +112,6 @@ void DiskController::freeInode(std::fstream& fs,
 
 void DiskController::updateInode(std::fstream& fs, const Specs::Superblock& sb,
     int32_t idx, const Specs::Inode& node) {
-    // Always persist to disk first
-    writeInode(fs, sb, idx, node);
-
     // Synchronize the cache
     std::unordered_map<int32_t, CacheEntry>::iterator it = inodeCache.find(idx);
 
@@ -113,14 +121,16 @@ void DiskController::updateInode(std::fstream& fs, const Specs::Superblock& sb,
         lruList.erase(it->second.it);
         lruList.push_front(idx);
 
+        it->second.dirty = true;
         it->second.it = lruList.begin();
     }
     // If it doesn't exist in cache, just add it as the most recently used
     else {
-        enforceCacheLimit();
+        enforceCacheLimit(fs, sb);
         lruList.push_front(idx);
 
         CacheEntry newNode;
+        newNode.dirty = false;
         newNode.it = lruList.begin();
         newNode.node = node;
 
@@ -129,43 +139,25 @@ void DiskController::updateInode(std::fstream& fs, const Specs::Superblock& sb,
 }
 
 int32_t DiskController::allocateBlock(std::fstream& fs, const Specs::Superblock& sb) {
-    for (uint32_t i = 0; i < sb.dataBlockCount; ++i) {
-        uint32_t byteIdx = i / 8;
+    int32_t idx = findFreeBit(dataBitmap, sb.dataBlockCount);
 
-        uint32_t bitIdx = i % 8;
-
-        if (!(dataBitmap[byteIdx] & (1 << bitIdx))) {
-            dataBitmap[byteIdx] |= (1 << bitIdx);
-
-            // Mark it as dirty (no disk I/O yet)
-            dataBitmapDirty = true;
-
-            return (int32_t)i;
-        }
+    if (idx != Specs::NULL_INDEX) {
+        dataBitmap[idx / 8] |= (1 << (idx % 8));
+        dataBitmapDirty = true;
     }
 
-    return Specs::NULL_INDEX;
+    return idx;
 }
 
 int32_t DiskController::allocateInode(std::fstream& fs, const Specs::Superblock& sb) {
-    for (uint32_t i = 0; i < sb.inodeCount; ++i) {
-        uint32_t byteIdx = i / 8;
+    int32_t idx = findFreeBit(inodeBitmap, sb.inodeCount);
 
-        uint32_t bitIdx = i % 8;
-
-        // Check if free
-        if (!(inodeBitmap[byteIdx] & (1 << bitIdx))) {
-            // Mark as used
-            inodeBitmap[byteIdx] |= (1 << bitIdx);
-
-            // Mark it as dirty (no disk I/O yet)
-            inodeBitmapDirty = true;
-
-            return (int32_t)i;
-        }
+    if (idx != Specs::NULL_INDEX) {
+        inodeBitmap[idx / 8] |= (1 << (idx % 8));
+        inodeBitmapDirty = true;
     }
 
-    return Specs::NULL_INDEX;
+    return idx;
 }
 
 void DiskController::sync(std::fstream& fs, const Specs::Superblock& sb) {
@@ -180,6 +172,14 @@ void DiskController::sync(std::fstream& fs, const Specs::Superblock& sb) {
         fs.write(reinterpret_cast<const char*>(dataBitmap.data()), dataBitmap.size());
 
         dataBitmapDirty = false;
+    }
+
+    for (std::pair<const int32_t, CacheEntry>& pair : inodeCache) {
+        if (pair.second.dirty) {
+            writeInode(fs, sb, pair.first, pair.second.node);
+
+            pair.second.dirty = false;
+        }
     }
 
     // Ensure the OS actually pushes the data to the physical drive
@@ -207,9 +207,52 @@ void DiskController::writeBlock(std::fstream& fs, const Specs::Superblock& sb,
     fs.write(buffer, sb.blockSize);
 }
 
-void DiskController::enforceCacheLimit() {
+int32_t DiskController::findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount) {
+    const uint64_t* data64 = reinterpret_cast<const uint64_t*>(bitmap.data());
+    size_t numWords = bitmap.size() / 8;
+
+    for (size_t i = 0; i < numWords; ++i) {
+        // 0xFFFFFFFFFFFFFFFF means all 64 bits are 1 (full)
+        if (data64[i] != ~0ULL) {
+            // There is at least one 0 here
+            for (int bit = 0; bit < 64; ++bit) {
+                uint64_t mask = 1ULL << bit;
+
+                if (!(data64[i] & mask)) {
+                    int32_t foundIdx = (i * 64) + bit;
+
+                    return (foundIdx < (int32_t)totalCount) ? foundIdx : Specs::NULL_INDEX;
+                }
+            }
+        }
+    }
+
+    // Handle remaining bytes if the bitmap size isn't a multiple of 8
+    for (size_t i = numWords * 8; i < bitmap.size(); ++i) {
+        if (bitmap[i] != 0xFF) {
+            for (int bit = 0; bit < 8; ++bit) {
+                if (!(bitmap[i] & (1 << bit))) {
+                    int32_t foundIdx = (i * 8) + bit;
+
+                    return (foundIdx < (int32_t)totalCount) ? foundIdx : Specs::NULL_INDEX;
+                }
+            }
+        }
+    }
+
+    return Specs::NULL_INDEX;
+}
+
+void DiskController::enforceCacheLimit(std::fstream& fs, const Specs::Superblock& sb) {
     if (inodeCache.size() >= CACHE_CAPACITY) {
         int32_t lastIdx = lruList.back();
+
+        std::unordered_map<int32_t, CacheEntry>::iterator it = inodeCache.find(lastIdx);
+
+        if (it->second.dirty) {
+            writeInode(fs, sb, lastIdx, it->second.node);
+        }
+
         lruList.pop_back();
 
         inodeCache.erase(lastIdx);

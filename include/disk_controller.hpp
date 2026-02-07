@@ -10,12 +10,12 @@
 
 class DiskController {
 public:
-    // Initialization
+    // --- INITIALIZATION ---
     static Specs::Superblock initNewDisk(std::fstream& fs, uint64_t maxSize);
 
     void loadBitmaps(std::fstream& fs, const Specs::Superblock& sb);
 
-    // Inode management (cached)
+    // --- INODE MANAGEMENT ---
     Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
 
     void freeInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
@@ -23,14 +23,14 @@ public:
     void updateInode(std::fstream& fs, const Specs::Superblock& sb,
         int32_t idx, const Specs::Inode& node);
 
-    // Allocation (bitmap-based)
+    // --- BITMAP OPERATIONS ---
     int32_t allocateBlock(std::fstream& fs, const Specs::Superblock& sb);
 
     int32_t allocateInode(std::fstream& fs, const Specs::Superblock& sb);
 
     void sync(std::fstream& fs, const Specs::Superblock& sb);
 
-    // Raw disk I/O
+    // --- I/O ---
     void readBlock(std::fstream& fs, const Specs::Superblock& sb,
         int32_t blockIdx, char* buffer);
 
@@ -38,11 +38,13 @@ public:
         int32_t blockIdx, const char* buffer);
 
 private:
-    void enforceCacheLimit();
+    int32_t findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount);
+
+    void enforceCacheLimit(std::fstream& fs, const Specs::Superblock& sb);
 
     void freeBlock(int32_t blockIdx);
 
-    // Internal helpers for raw disk access
+    // --- RAW DISK I/O ---
     Specs::Inode readInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
 
     void writeInode(std::fstream& fs, const Specs::Superblock& sb,
@@ -54,6 +56,9 @@ private:
     struct CacheEntry {
         Specs::Inode node;
         std::list<int32_t>::iterator it;
+
+        // Track if memory differs from disk
+        bool dirty = false;
     };
 
     std::unordered_map<int32_t, CacheEntry> inodeCache;

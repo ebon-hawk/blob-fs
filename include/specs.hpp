@@ -9,6 +9,10 @@ namespace Specs {
     constexpr uint32_t INODE_SIZE = 256;
     constexpr uint32_t MAGIC_NUMBER = 0x5346;
 
+    inline uint32_t bitsToBytes(uint32_t bits) {
+        return (bits + 7) / 8;
+    }
+
     struct Superblock {
         uint32_t magicNumber;
 
