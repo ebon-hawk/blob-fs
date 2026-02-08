@@ -3,6 +3,187 @@
 
 #include "file_system.hpp"
 
+FileSystem::FileSystem(std::fstream& file, const Specs::Superblock& superblock)
+    : controller(), fs(file), sb(superblock), currentDirIdx(0), prevDirIdx(Specs::NULL_INDEX) {
+}
+
+void FileSystem::cd(const std::string& path) {
+    if (path.empty()) {
+        std::cout << getFullPath(currentDirIdx) << std::endl;
+
+        return;
+    }
+
+    if (path == "~") {
+        updateCurrentDir(0);
+
+        return;
+    }
+
+    // Toggle to previous directory
+    if (path == "-") {
+        if (prevDirIdx == Specs::NULL_INDEX) {
+            throw std::runtime_error("cd: OLDPWD not set");
+        }
+        else {
+            // Print the directory we are switching to, as real shells do
+            std::cout << getFullPath(prevDirIdx) << std::endl;
+
+            updateCurrentDir(prevDirIdx);
+        }
+
+        return;
+    }
+
+    // Standard path (including '.' and '..')
+    int32_t targetIdx = resolvePath(path);
+
+    if (targetIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("cd: No such file or directory");
+    }
+
+    const Specs::Inode& node = controller.getInode(fs, sb, targetIdx);
+
+    if (!node.isDirectory) {
+        throw std::runtime_error("cd: Not a directory");
+    }
+
+    updateCurrentDir(targetIdx);
+}
+
+void FileSystem::ls(const std::string& path) {
+    // Resolve the directory index to list
+    int32_t dirIdx = path.empty() ? currentDirIdx : resolvePath(path);
+
+    if (dirIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("ls: No such file or directory");
+    }
+
+    // Get inode and check if directory
+    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
+
+    if (!dirNode.isDirectory) {
+        throw std::runtime_error("ls: Not a directory");
+    }
+
+    // Iterate over children and print names
+    int32_t childIdx = dirNode.firstChild;
+
+    if (childIdx == Specs::NULL_INDEX) return;
+
+    std::cout << "Type\tSize\tName\n";
+
+    std::cout << "-------------------------------\n";
+
+    while (childIdx != Specs::NULL_INDEX) {
+        Specs::Inode child = controller.getInode(fs, sb, childIdx);
+        char type = child.isDirectory ? 'd' : 'f';
+        std::cout << type << "\t" << child.size << "\t" << child.name << "\n";
+
+        childIdx = child.nextSibling;
+    }
+
+    std::cout << std::endl;
+}
+
+void FileSystem::mkdir(const std::string& path) {
+    if (path.empty()) {
+        throw std::runtime_error("mkdir: Missing operand");
+    }
+
+    // Tokenize path, get parent path and new directory name
+    std::vector<std::string> tokens = tokenize(path);
+
+    if (tokens.empty()) {
+        throw std::runtime_error("mkdir: Invalid path");
+    }
+
+    std::string newDirName = tokens.back();
+    tokens.pop_back();
+
+    if (!isValidFilename(newDirName)) {
+        throw std::runtime_error("mkdir: Invalid directory name");
+    }
+
+    // Determine parent directory index
+    int32_t parentIdx = 0;
+
+    if (!tokens.empty()) {
+        std::string parentPath;
+
+        for (const std::string& tok : tokens) {
+            parentPath += "/" + tok;
+        }
+
+        parentIdx = resolvePath(parentPath);
+
+        if (parentIdx == Specs::NULL_INDEX) {
+            throw std::runtime_error("mkdir: Parent directory does not exist");
+        }
+    }
+    else if (path[0] != '/') {
+        // Relative path, so parent is current dir
+        parentIdx = currentDirIdx;
+    }
+
+    Specs::Inode parent = controller.getInode(fs, sb, parentIdx);
+
+    if (!parent.isDirectory) {
+        throw std::runtime_error("mkdir: Parent is not a directory");
+    }
+
+    // Check if directory with this name already exists
+    if (findChildInDirectory(parentIdx, newDirName) != Specs::NULL_INDEX) {
+        throw std::runtime_error("mkdir: Directory already exists");
+    }
+
+    // Allocate new inode for the directory
+    int32_t newDirIdx = controller.allocateInode(fs, sb);
+
+    Specs::Inode newDirNode;
+    newDirNode.isDirectory = true;
+    newDirNode.size = 0;
+
+    newDirNode.firstChild = Specs::NULL_INDEX;
+    newDirNode.parent = parentIdx;
+
+    newDirNode.nextSibling = Specs::NULL_INDEX;
+    newDirNode.prevSibling = Specs::NULL_INDEX;
+    std::strncpy(newDirNode.name, newDirName.c_str(), sizeof(newDirNode.name) - 1);
+
+    newDirNode.name[sizeof(newDirNode.name) - 1] = '\0';
+
+    // Save new inode
+    controller.updateInode(fs, sb, newDirIdx, newDirNode);
+
+    // Add new inode as a child of parent directory
+    addEntryToDirectory(parentIdx, newDirIdx);
+}
+
+void FileSystem::rmdir(const std::string& path) {
+    int32_t dirIdx = resolvePath(path);
+
+    if (dirIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("rmdir: No such directory");
+    }
+
+    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
+
+    if (!dirNode.isDirectory) {
+        throw std::runtime_error("rmdir: Not a directory");
+    }
+
+    if (!isDirectoryEmpty(dirIdx)) {
+        throw std::runtime_error("rmdir: Directory not empty");
+    }
+
+    // Remove directory from parent's child list
+    unlinkInodeFromParent(dirIdx);
+
+    // Free the inode
+    controller.freeInode(fs, sb, dirIdx);
+}
+
 int32_t FileSystem::resolvePath(const std::string& path) {
     if (path.empty()) return currentDirIdx;
 
@@ -85,6 +266,23 @@ int32_t FileSystem::findChildInDirectory(int32_t dirIdx, const std::string& name
     return Specs::NULL_INDEX;
 }
 
+std::string FileSystem::getFullPath(int32_t idx) {
+    if (idx == 0) return "/";
+
+    std::string path = "";
+
+    int32_t curr = idx;
+
+    while (curr != 0 && curr != Specs::NULL_INDEX) {
+        const Specs::Inode& node = controller.getInode(fs, sb, curr);
+        path = "/" + std::string(node.name) + path;
+
+        curr = node.parent;
+    }
+
+    return path.empty() ? "/" : path;
+}
+
 std::vector<int32_t> FileSystem::findAllMatches(int32_t dirIdx, const std::string& pattern) {
     std::vector<int32_t> matches;
 
@@ -118,6 +316,14 @@ std::vector<std::string> FileSystem::tokenize(const std::string& path, char deli
     }
 
     return tokens;
+}
+
+void FileSystem::updateCurrentDir(int32_t newIdx) {
+    if (currentDirIdx != newIdx) {
+        prevDirIdx = currentDirIdx;
+
+        currentDirIdx = newIdx;
+    }
 }
 
 void FileSystem::addEntryToDirectory(int32_t parentIdx, int32_t childIdx) {

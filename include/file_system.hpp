@@ -35,11 +35,15 @@ private:
     // Finds a single exact match (used during path walking)
     int32_t findChildInDirectory(int32_t dirIdx, const std::string& name);
 
+    std::string getFullPath(int32_t idx);
+
     // Finds all children matching a wildcard pattern (used for cat, cp, ls, rm)
     std::vector<int32_t> findAllMatches(int32_t dirIdx, const std::string& pattern);
 
     // Splits "a/b/c" into ["a", "b", "c"]
     std::vector<std::string> tokenize(const std::string& path, char delimiter = '/');
+
+    void updateCurrentDir(int32_t newIdx);
 
     // --- TREE MANIPULATION HELPERS ---
     void addEntryToDirectory(int32_t parentIdx, int32_t childIdx);
@@ -68,6 +72,8 @@ private:
 
     // The "state" (where the user is right now)
     int32_t currentDirIdx;
+
+    int32_t prevDirIdx;
 };
 
 #endif // FILE_SYSTEM_HPP
