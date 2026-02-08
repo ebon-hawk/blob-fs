@@ -18,6 +18,9 @@ public:
     // --- INODE MANAGEMENT ---
     Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
 
+    int32_t copyInode(std::fstream& fs, const Specs::Superblock& sb,
+        int32_t srcIdx, int32_t parentIdx);
+
     void freeInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
 
     void updateInode(std::fstream& fs, const Specs::Superblock& sb,

@@ -58,6 +58,103 @@ Specs::Inode DiskController::getInode(std::fstream& fs,
     return node;
 }
 
+int32_t DiskController::copyInode(std::fstream& fs, const Specs::Superblock& sb,
+    int32_t srcIdx, int32_t parentIdx) {
+    int32_t newIdx = allocateInode(fs, sb);
+
+    if (newIdx == Specs::NULL_INDEX) return Specs::NULL_INDEX;
+
+    Specs::Inode srcNode = getInode(fs, sb, srcIdx);
+
+    Specs::Inode newNode{};
+    newNode.isDirectory = srcNode.isDirectory;
+    newNode.parent = parentIdx;
+    newNode.size = srcNode.size;
+    strncpy(newNode.name, srcNode.name, sizeof(newNode.name));
+
+    newNode.name[sizeof(newNode.name) - 1] = '\0';
+
+    if (newNode.isDirectory) {
+        updateInode(fs, sb, newIdx, newNode);
+
+        return newIdx;
+    }
+
+    // Copy direct blocks
+    for (int i = 0; i < 32; ++i) {
+        if (srcNode.directBlocks[i] == Specs::NULL_INDEX) continue;
+
+        int32_t blockIdx = allocateBlock(fs, sb);
+
+        if (blockIdx == Specs::NULL_INDEX) {
+            updateInode(fs, sb, newIdx, newNode);
+
+            freeInode(fs, sb, newIdx);
+
+            return Specs::NULL_INDEX;
+        }
+
+        std::vector<char> buffer(sb.blockSize);
+
+        readBlock(fs, sb, srcNode.directBlocks[i], buffer.data());
+        writeBlock(fs, sb, blockIdx, buffer.data());
+
+        newNode.directBlocks[i] = blockIdx;
+    }
+
+    if (srcNode.indirectBlock != Specs::NULL_INDEX) {
+        uint32_t pointersPerBlock = sb.blockSize / sizeof(int32_t);
+
+        // Allocate new indirect block
+        int32_t newIndirect = allocateBlock(fs, sb);
+
+        if (newIndirect == Specs::NULL_INDEX) {
+            updateInode(fs, sb, newIdx, newNode);
+
+            freeInode(fs, sb, newIdx);
+
+            return Specs::NULL_INDEX;
+        }
+
+        std::vector<int32_t> srcTable(pointersPerBlock);
+
+        std::vector<int32_t> newTable(pointersPerBlock, Specs::NULL_INDEX);
+
+        readBlock(fs, sb, srcNode.indirectBlock,
+            reinterpret_cast<char*>(srcTable.data()));
+
+        for (uint32_t i = 0; i < pointersPerBlock; ++i) {
+            if (srcTable[i] == Specs::NULL_INDEX) continue;
+
+            int32_t dataBlock = allocateBlock(fs, sb);
+
+            if (dataBlock == Specs::NULL_INDEX) {
+                updateInode(fs, sb, newIdx, newNode);
+
+                freeInode(fs, sb, newIdx);
+
+                return Specs::NULL_INDEX;
+            }
+
+            std::vector<char> buffer(sb.blockSize);
+
+            readBlock(fs, sb, srcTable[i], buffer.data());
+            writeBlock(fs, sb, dataBlock, buffer.data());
+
+            newTable[i] = dataBlock;
+        }
+
+        writeBlock(fs, sb, newIndirect,
+            reinterpret_cast<char*>(newTable.data()));
+
+        newNode.indirectBlock = newIndirect;
+    }
+
+    updateInode(fs, sb, newIdx, newNode);
+
+    return newIdx;
+}
+
 void DiskController::freeInode(std::fstream& fs,
     const Specs::Superblock& sb, int32_t idx) {
     // Fetch the inode to find its block pointers

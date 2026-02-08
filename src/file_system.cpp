@@ -184,6 +184,233 @@ void FileSystem::rmdir(const std::string& path) {
     controller.freeInode(fs, sb, dirIdx);
 }
 
+void FileSystem::cat(const std::string& pattern) {
+    std::vector<std::string> parts = tokenize(pattern);
+
+    int32_t dirIdx = currentDirIdx;
+    std::string namePattern;
+
+    if (parts.size() == 0) return;
+
+    if (parts.size() == 1) {
+        namePattern = parts[0];
+    }
+    else {
+        std::string dirPath;
+
+        for (size_t i = 0; i + 1 < parts.size(); ++i) {
+            if (i) dirPath += "/";
+
+            dirPath += parts[i];
+        }
+
+        dirIdx = resolvePath(dirPath);
+
+        if (dirIdx == Specs::NULL_INDEX) {
+            throw std::runtime_error("cat: No such directory");
+        }
+
+        namePattern = parts.back();
+    }
+
+    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
+
+    if (!dirNode.isDirectory) {
+        throw std::runtime_error("cat: Not a directory");
+    }
+
+    std::vector<int32_t> matches = findAllMatches(dirIdx, namePattern);
+
+    if (matches.empty()) {
+        throw std::runtime_error("cat: No matching files");
+    }
+
+    for (size_t m = 0; m < matches.size(); ++m) {
+        Specs::Inode node = controller.getInode(fs, sb, matches[m]);
+
+        if (node.isDirectory) {
+            continue;
+        }
+
+        uint32_t remaining = node.size;
+
+        // Direct blocks
+        for (int i = 0; i < 32 && remaining > 0; ++i) {
+            if (node.directBlocks[i] == Specs::NULL_INDEX) break;
+
+            std::vector<char> buffer(sb.blockSize);
+
+            controller.readBlock(fs, sb, node.directBlocks[i], buffer.data());
+            uint32_t toWrite = remaining < sb.blockSize ? remaining : sb.blockSize;
+
+            std::cout.write(buffer.data(), toWrite);
+
+            remaining -= toWrite;
+        }
+
+        // Indirect blocks
+        if (remaining > 0 && node.indirectBlock != Specs::NULL_INDEX) {
+            uint32_t perBlock = sb.blockSize / sizeof(int32_t);
+
+            std::vector<int32_t> table(perBlock);
+
+            controller.readBlock(
+                fs, sb,
+                node.indirectBlock,
+                reinterpret_cast<char*>(table.data())
+            );
+
+            for (uint32_t i = 0; i < perBlock && remaining > 0; ++i) {
+                if (table[i] == Specs::NULL_INDEX) break;
+
+                std::vector<char> buffer(sb.blockSize);
+
+                controller.readBlock(fs, sb, table[i], buffer.data());
+                uint32_t toWrite = remaining < sb.blockSize ? remaining : sb.blockSize;
+
+                std::cout.write(buffer.data(), toWrite);
+
+                remaining -= toWrite;
+            }
+        }
+
+        if (m + 1 < matches.size()) {
+            std::cout << "\n";
+        }
+    }
+}
+
+void FileSystem::cp(const std::string& sourcePattern, const std::string& destPath) {
+    std::vector<std::string> srcTokens = tokenize(sourcePattern);
+
+    std::string pattern = srcTokens.back();
+
+    srcTokens.pop_back();
+
+    int32_t srcDir = currentDirIdx;
+
+    if (!srcTokens.empty()) {
+        std::string srcDirPath;
+
+        for (const std::string& tok : srcTokens) srcDirPath += "/" + tok;
+
+        srcDir = resolvePath(srcDirPath);
+    }
+
+    if (srcDir == Specs::NULL_INDEX)
+        throw std::runtime_error("cp: Invalid source path");
+
+    std::vector<int32_t> sources = findAllMatches(srcDir, pattern);
+
+    if (sources.empty())
+        throw std::runtime_error("cp: No matching files");
+
+    int32_t destIdx = resolvePath(destPath);
+
+    bool destExists = (destIdx != Specs::NULL_INDEX);
+    bool destIsDir = false;
+
+    if (destExists) {
+        destIsDir = controller.getInode(fs, sb, destIdx).isDirectory;
+    }
+
+    if (sources.size() > 1 && (!destExists || !destIsDir))
+        throw std::runtime_error("cp: Destination must be directory");
+
+    std::vector<std::string> destTokens = tokenize(destPath);
+
+    std::string destName = destTokens.empty() ? "" : destTokens.back();
+
+    int32_t destDir = destIdx;
+
+    if (!destExists || !destIsDir) {
+        destTokens.pop_back();
+
+        destDir = currentDirIdx;
+
+        if (!destTokens.empty()) {
+            std::string parentPath;
+
+            for (const std::string& tok : destTokens) parentPath += "/" + tok;
+
+            destDir = resolvePath(parentPath);
+        }
+
+        if (destDir == Specs::NULL_INDEX)
+            throw std::runtime_error("cp: Invalid destination path");
+    }
+
+    for (int32_t srcIdx : sources) {
+        Specs::Inode srcNode = controller.getInode(fs, sb, srcIdx);
+
+        std::string name =
+            (destIsDir || sources.size() > 1) ? srcNode.name : destName;
+
+        if (findChildInDirectory(destDir, name) != Specs::NULL_INDEX)
+            throw std::runtime_error("cp: File exists");
+
+        int32_t newIdx = controller.copyInode(fs, sb, srcIdx, destDir);
+
+        if (newIdx == Specs::NULL_INDEX)
+            throw std::runtime_error("cp: Out of space");
+
+        Specs::Inode newNode = controller.getInode(fs, sb, newIdx);
+        strncpy(newNode.name, name.c_str(), sizeof(newNode.name));
+
+        newNode.name[sizeof(newNode.name) - 1] = '\0';
+
+        controller.updateInode(fs, sb, newIdx, newNode);
+
+        addEntryToDirectory(destDir, newIdx);
+    }
+}
+
+void FileSystem::rm(const std::string& pattern) {
+    // Separate directory and filename pattern
+    size_t lastSlash = pattern.find_last_of('/');
+    std::string dirPath;
+    std::string filePattern;
+
+    if (lastSlash == std::string::npos) {
+        // No directory part, use current directory
+        dirPath = "";
+        filePattern = pattern;
+    }
+    else {
+        dirPath = pattern.substr(0, lastSlash);
+        filePattern = pattern.substr(lastSlash + 1);
+    }
+
+    // Resolve directory index, empty 'dirPath' means 'currentDirIdx'
+    int32_t dirIdx = dirPath.empty() ? currentDirIdx : resolvePath(dirPath);
+
+    if (dirIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("rm: No such directory: " + dirPath);
+    }
+
+    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
+
+    if (!dirNode.isDirectory) {
+        throw std::runtime_error("rm: Not a directory: " + dirPath);
+    }
+
+    std::vector<int32_t> matches = findAllMatches(dirIdx, filePattern);
+
+    if (matches.empty()) {
+        throw std::runtime_error("rm: No files match the pattern");
+    }
+
+    for (int32_t idx : matches) {
+        Specs::Inode node = controller.getInode(fs, sb, idx);
+
+        if (!node.isDirectory) {
+            unlinkInodeFromParent(idx);
+
+            deleteInodeRecursive(idx);
+        }
+    }
+}
+
 int32_t FileSystem::resolvePath(const std::string& path) {
     if (path.empty()) return currentDirIdx;
 
