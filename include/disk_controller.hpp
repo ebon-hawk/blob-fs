@@ -2,75 +2,67 @@
 #define DISK_CONTROLLER_HPP
 
 #include <fstream>
-#include <list>
-#include <unordered_map>
 #include <vector>
 
+#include "lru_cache.hpp"
 #include "specs.hpp"
 
-class DiskController {
-public:
-    // --- INITIALIZATION ---
-    static Specs::Superblock initNewDisk(std::fstream& fs, uint64_t maxSize);
+struct InodeEntry {
+    Specs::Inode node;
+    bool dirty = false;
+};
 
-    void loadBitmaps(std::fstream& fs, const Specs::Superblock& sb);
+class DiskController : public ICacheEventHandler<int32_t, InodeEntry> {
+public:
+    DiskController(std::fstream& fs, const Specs::Superblock& sb);
+
+    virtual ~DiskController();
+
+    // --- INITIALIZATION ---
+    void loadBitmaps();
 
     // --- INODE MANAGEMENT ---
-    Specs::Inode getInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
-
-    int32_t copyInode(std::fstream& fs, const Specs::Superblock& sb,
-        int32_t srcIdx, int32_t parentIdx);
-
-    void freeInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
-
-    void updateInode(std::fstream& fs, const Specs::Superblock& sb,
-        int32_t idx, const Specs::Inode& node);
+    InodeEntry* getInode(int32_t idx);
+    int32_t copyInode(int32_t srcIdx, int32_t parentIdx);
+    void freeInode(int32_t idx);
+    void updateInode(int32_t idx, const Specs::Inode& node);
 
     // --- BITMAP OPERATIONS ---
-    int32_t allocateBlock(std::fstream& fs, const Specs::Superblock& sb);
-
-    int32_t allocateInode(std::fstream& fs, const Specs::Superblock& sb);
-
-    void sync(std::fstream& fs, const Specs::Superblock& sb);
+    int32_t allocateBlock();
+    int32_t allocateInode();
+    void sync();
 
     // --- I/O ---
-    void readBlock(std::fstream& fs, const Specs::Superblock& sb,
-        int32_t blockIdx, char* buffer);
+    void readBlock(int32_t blockIdx, char* buffer);
+    void writeBlock(int32_t blockIdx, const char* buffer);
 
-    void writeBlock(std::fstream& fs, const Specs::Superblock& sb,
-        int32_t blockIdx, const char* buffer);
+    // --- INTERFACE IMPLEMENTATION ---
+    bool onEvict(const int32_t& key, InodeEntry& value) override;
 
 private:
-    int32_t findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount);
-
-    void enforceCacheLimit(std::fstream& fs, const Specs::Superblock& sb);
-
+    int32_t findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint);
     void freeBlock(int32_t blockIdx);
 
     // --- RAW DISK I/O ---
-    Specs::Inode readInode(std::fstream& fs, const Specs::Superblock& sb, int32_t idx);
-
-    void writeInode(std::fstream& fs, const Specs::Superblock& sb,
-        int32_t idx, const Specs::Inode& node);
+    Specs::Inode readInode(int32_t idx);
+    void writeInode(int32_t idx, const Specs::Inode& node);
 
 private:
     static const size_t CACHE_CAPACITY;
 
-    struct CacheEntry {
-        Specs::Inode node;
-        std::list<int32_t>::iterator it;
+    std::fstream& fs;
 
-        // Track if memory differs from disk
-        bool dirty = false;
-    };
+    const Specs::Superblock& sb;
 
-    std::unordered_map<int32_t, CacheEntry> inodeCache;
-    std::vector<uint8_t> dataBitmap;
+    LRUCache<int32_t, InodeEntry> inodeCache;
+
+    std::vector<uint8_t> blockBitmap;
     std::vector<uint8_t> inodeBitmap;
 
-    std::list<int32_t> lruList;
+    uint32_t lastBlockHint = 0;
+    uint32_t lastInodeHint = 0;
 
-    bool dataBitmapDirty = false;
+    bool blockBitmapDirty = false;
     bool inodeBitmapDirty = false;
 };
 
