@@ -1,3 +1,6 @@
+#ifndef LRU_CACHE_HPP
+#define LRU_CACHE_HPP
+
 #include <list>
 #include <stdexcept>
 #include <unordered_map>
@@ -133,3 +136,5 @@ private:
 
     ICacheEventHandler<Key, Value>* handler;
 };
+
+#endif // LRU_CACHE_HPP
