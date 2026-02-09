@@ -2,12 +2,18 @@
 #define FILE_SYSTEM_HPP
 
 #include <fstream>
-#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "disk_controller.hpp"
+#include "lru_cache.hpp"
 #include "specs.hpp"
+
+// Directory entry cache: maps filename to inode index
+struct Dentry {
+    std::unordered_map<std::string, int32_t> nameToInode;
+};
 
 class FileSystem {
 public:
@@ -31,18 +37,12 @@ public:
     void sync();
 
 private:
-    // --- NAVIGATION HELPERS ---
-    // Finds a single exact match (used during path walking)
+    // --- DATA HELPERS ---
+    Dentry* getOrPopulateDentry(int32_t dirIdx);
     int32_t findChildInDirectory(int32_t dirIdx, const std::string& name);
-
     std::string getFullPath(int32_t idx);
-
-    // Finds all children matching a wildcard pattern (used for cat, cp, ls, rm)
     std::vector<int32_t> findAllMatches(int32_t dirIdx, const std::string& pattern);
-
-    // Splits "a/b/c" into ["a", "b", "c"]
-    std::vector<std::string> tokenize(const std::string& path, char delimiter = '/');
-
+    void attachBlockToInode(Specs::Inode& node, int32_t inodeIdx, int32_t blockIdx);
     void updateCurrentDir(int32_t newIdx);
 
     // --- TREE MANIPULATION HELPERS ---
@@ -50,30 +50,24 @@ private:
     void deleteInodeRecursive(int32_t idx);
     void unlinkInodeFromParent(int32_t targetIdx);
 
-    // --- DATA HELPERS ---
-    bool matchesPattern(const std::string& pattern, const std::string& name);
-
-    // Links a new data block to an inode (handles direct/indirect pointers)
-    void attachBlockToInode(Specs::Inode& node, int32_t inodeIdx, int32_t blockIdx);
-
     // --- EDGE CASE VALIDATORS ---
     bool isDirectoryEmpty(int32_t dirIdx);
     bool isValidFilename(const std::string& name);
 
 private:
-    // Cache/bitmap manager
-    DiskController controller;
+    static const size_t CACHE_CAPACITY;
 
-    // Reference to the open disk file
     std::fstream& fs;
 
-    // Cached copy of the superblock
     Specs::Superblock sb;
 
-    // The "state" (where the user is right now)
-    int32_t currentDirIdx;
+    DiskController controller;
 
-    int32_t prevDirIdx;
+    LRUCache<int32_t, Dentry> dirCache;
+
+    int32_t currentDirIdx = 0;
+
+    int32_t prevDirIdx = Specs::NULL_INDEX;
 };
 
 #endif // FILE_SYSTEM_HPP

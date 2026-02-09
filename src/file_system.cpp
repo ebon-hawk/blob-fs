@@ -1,510 +1,76 @@
 #include <iostream>
-#include <sstream>
+#include <stdexcept>
 
 #include "file_system.hpp"
+#include "string_utils.hpp"
 
-FileSystem::FileSystem(std::fstream& file, const Specs::Superblock& superblock)
-    : controller(), fs(file), sb(superblock), currentDirIdx(0), prevDirIdx(Specs::NULL_INDEX) {
-}
+// --- DATA HELPERS ---
+Dentry* FileSystem::getOrPopulateDentry(int32_t dirIdx) {
+    Dentry* cached = dirCache.get(dirIdx);
 
-void FileSystem::cd(const std::string& path) {
-    if (path.empty()) {
-        std::cout << getFullPath(currentDirIdx) << std::endl;
+    if (cached) return cached;
 
-        return;
+    InodeEntry* entry = controller.getInode(dirIdx);
+
+    if (!entry || !entry->node.isDirectory) {
+        return nullptr;
     }
 
-    if (path == "~") {
-        updateCurrentDir(0);
+    Dentry newDentry;
+    int32_t childIdx = entry->node.firstChild;
 
-        return;
-    }
+    // Iterate through the linked list of siblings on disk
+    while (childIdx != Specs::NULL_INDEX) {
+        InodeEntry* childEntry = controller.getInode(childIdx);
 
-    // Toggle to previous directory
-    if (path == "-") {
-        if (prevDirIdx == Specs::NULL_INDEX) {
-            throw std::runtime_error("cd: OLDPWD not set");
+        if (childEntry) {
+            // Map the filename string to its inode index
+            newDentry.nameToInode[childEntry->node.name] = childIdx;
+
+            childIdx = childEntry->node.nextSibling;
         }
         else {
-            // Print the directory we are switching to, as real shells do
-            std::cout << getFullPath(prevDirIdx) << std::endl;
-
-            updateCurrentDir(prevDirIdx);
-        }
-
-        return;
-    }
-
-    // Standard path (including '.' and '..')
-    int32_t targetIdx = resolvePath(path);
-
-    if (targetIdx == Specs::NULL_INDEX) {
-        throw std::runtime_error("cd: No such file or directory");
-    }
-
-    const Specs::Inode& node = controller.getInode(fs, sb, targetIdx);
-
-    if (!node.isDirectory) {
-        throw std::runtime_error("cd: Not a directory");
-    }
-
-    updateCurrentDir(targetIdx);
-}
-
-void FileSystem::ls(const std::string& path) {
-    // Resolve the directory index to list
-    int32_t dirIdx = path.empty() ? currentDirIdx : resolvePath(path);
-
-    if (dirIdx == Specs::NULL_INDEX) {
-        throw std::runtime_error("ls: No such file or directory");
-    }
-
-    // Get inode and check if directory
-    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
-
-    if (!dirNode.isDirectory) {
-        throw std::runtime_error("ls: Not a directory");
-    }
-
-    // Iterate over children and print names
-    int32_t childIdx = dirNode.firstChild;
-
-    if (childIdx == Specs::NULL_INDEX) return;
-
-    std::cout << "Type\tSize\tName\n";
-
-    std::cout << "-------------------------------\n";
-
-    while (childIdx != Specs::NULL_INDEX) {
-        Specs::Inode child = controller.getInode(fs, sb, childIdx);
-        char type = child.isDirectory ? 'd' : 'f';
-        std::cout << type << "\t" << child.size << "\t" << child.name << "\n";
-
-        childIdx = child.nextSibling;
-    }
-
-    std::cout << std::endl;
-}
-
-void FileSystem::mkdir(const std::string& path) {
-    if (path.empty()) {
-        throw std::runtime_error("mkdir: Missing operand");
-    }
-
-    // Tokenize path, get parent path and new directory name
-    std::vector<std::string> tokens = tokenize(path);
-
-    if (tokens.empty()) {
-        throw std::runtime_error("mkdir: Invalid path");
-    }
-
-    std::string newDirName = tokens.back();
-    tokens.pop_back();
-
-    if (!isValidFilename(newDirName)) {
-        throw std::runtime_error("mkdir: Invalid directory name");
-    }
-
-    // Determine parent directory index
-    int32_t parentIdx = 0;
-
-    if (!tokens.empty()) {
-        std::string parentPath;
-
-        for (const std::string& tok : tokens) {
-            parentPath += "/" + tok;
-        }
-
-        parentIdx = resolvePath(parentPath);
-
-        if (parentIdx == Specs::NULL_INDEX) {
-            throw std::runtime_error("mkdir: Parent directory does not exist");
+            break;
         }
     }
-    else if (path[0] != '/') {
-        // Relative path, so parent is current dir
-        parentIdx = currentDirIdx;
-    }
 
-    Specs::Inode parent = controller.getInode(fs, sb, parentIdx);
-
-    if (!parent.isDirectory) {
-        throw std::runtime_error("mkdir: Parent is not a directory");
-    }
-
-    // Check if directory with this name already exists
-    if (findChildInDirectory(parentIdx, newDirName) != Specs::NULL_INDEX) {
-        throw std::runtime_error("mkdir: Directory already exists");
-    }
-
-    // Allocate new inode for the directory
-    int32_t newDirIdx = controller.allocateInode(fs, sb);
-
-    Specs::Inode newDirNode;
-    newDirNode.isDirectory = true;
-    newDirNode.size = 0;
-
-    newDirNode.firstChild = Specs::NULL_INDEX;
-    newDirNode.parent = parentIdx;
-
-    newDirNode.nextSibling = Specs::NULL_INDEX;
-    newDirNode.prevSibling = Specs::NULL_INDEX;
-    std::strncpy(newDirNode.name, newDirName.c_str(), sizeof(newDirNode.name) - 1);
-
-    newDirNode.name[sizeof(newDirNode.name) - 1] = '\0';
-
-    // Save new inode
-    controller.updateInode(fs, sb, newDirIdx, newDirNode);
-
-    // Add new inode as a child of parent directory
-    addEntryToDirectory(parentIdx, newDirIdx);
-}
-
-void FileSystem::rmdir(const std::string& path) {
-    int32_t dirIdx = resolvePath(path);
-
-    if (dirIdx == Specs::NULL_INDEX) {
-        throw std::runtime_error("rmdir: No such directory");
-    }
-
-    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
-
-    if (!dirNode.isDirectory) {
-        throw std::runtime_error("rmdir: Not a directory");
-    }
-
-    if (!isDirectoryEmpty(dirIdx)) {
-        throw std::runtime_error("rmdir: Directory not empty");
-    }
-
-    // Remove directory from parent's child list
-    unlinkInodeFromParent(dirIdx);
-
-    // Free the inode
-    controller.freeInode(fs, sb, dirIdx);
-}
-
-void FileSystem::cat(const std::string& pattern) {
-    std::vector<std::string> parts = tokenize(pattern);
-
-    int32_t dirIdx = currentDirIdx;
-    std::string namePattern;
-
-    if (parts.size() == 0) return;
-
-    if (parts.size() == 1) {
-        namePattern = parts[0];
-    }
-    else {
-        std::string dirPath;
-
-        for (size_t i = 0; i + 1 < parts.size(); ++i) {
-            if (i) dirPath += "/";
-
-            dirPath += parts[i];
-        }
-
-        dirIdx = resolvePath(dirPath);
-
-        if (dirIdx == Specs::NULL_INDEX) {
-            throw std::runtime_error("cat: No such directory");
-        }
-
-        namePattern = parts.back();
-    }
-
-    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
-
-    if (!dirNode.isDirectory) {
-        throw std::runtime_error("cat: Not a directory");
-    }
-
-    std::vector<int32_t> matches = findAllMatches(dirIdx, namePattern);
-
-    if (matches.empty()) {
-        throw std::runtime_error("cat: No matching files");
-    }
-
-    for (size_t m = 0; m < matches.size(); ++m) {
-        Specs::Inode node = controller.getInode(fs, sb, matches[m]);
-
-        if (node.isDirectory) {
-            continue;
-        }
-
-        uint32_t remaining = node.size;
-
-        // Direct blocks
-        for (int i = 0; i < 32 && remaining > 0; ++i) {
-            if (node.directBlocks[i] == Specs::NULL_INDEX) break;
-
-            std::vector<char> buffer(sb.blockSize);
-
-            controller.readBlock(fs, sb, node.directBlocks[i], buffer.data());
-            uint32_t toWrite = remaining < sb.blockSize ? remaining : sb.blockSize;
-
-            std::cout.write(buffer.data(), toWrite);
-
-            remaining -= toWrite;
-        }
-
-        // Indirect blocks
-        if (remaining > 0 && node.indirectBlock != Specs::NULL_INDEX) {
-            uint32_t perBlock = sb.blockSize / sizeof(int32_t);
-
-            std::vector<int32_t> table(perBlock);
-
-            controller.readBlock(
-                fs, sb,
-                node.indirectBlock,
-                reinterpret_cast<char*>(table.data())
-            );
-
-            for (uint32_t i = 0; i < perBlock && remaining > 0; ++i) {
-                if (table[i] == Specs::NULL_INDEX) break;
-
-                std::vector<char> buffer(sb.blockSize);
-
-                controller.readBlock(fs, sb, table[i], buffer.data());
-                uint32_t toWrite = remaining < sb.blockSize ? remaining : sb.blockSize;
-
-                std::cout.write(buffer.data(), toWrite);
-
-                remaining -= toWrite;
-            }
-        }
-
-        if (m + 1 < matches.size()) {
-            std::cout << "\n";
-        }
-    }
-}
-
-void FileSystem::cp(const std::string& sourcePattern, const std::string& destPath) {
-    std::vector<std::string> srcTokens = tokenize(sourcePattern);
-
-    std::string pattern = srcTokens.back();
-
-    srcTokens.pop_back();
-
-    int32_t srcDir = currentDirIdx;
-
-    if (!srcTokens.empty()) {
-        std::string srcDirPath;
-
-        for (const std::string& tok : srcTokens) srcDirPath += "/" + tok;
-
-        srcDir = resolvePath(srcDirPath);
-    }
-
-    if (srcDir == Specs::NULL_INDEX)
-        throw std::runtime_error("cp: Invalid source path");
-
-    std::vector<int32_t> sources = findAllMatches(srcDir, pattern);
-
-    if (sources.empty())
-        throw std::runtime_error("cp: No matching files");
-
-    int32_t destIdx = resolvePath(destPath);
-
-    bool destExists = (destIdx != Specs::NULL_INDEX);
-    bool destIsDir = false;
-
-    if (destExists) {
-        destIsDir = controller.getInode(fs, sb, destIdx).isDirectory;
-    }
-
-    if (sources.size() > 1 && (!destExists || !destIsDir))
-        throw std::runtime_error("cp: Destination must be directory");
-
-    std::vector<std::string> destTokens = tokenize(destPath);
-
-    std::string destName = destTokens.empty() ? "" : destTokens.back();
-
-    int32_t destDir = destIdx;
-
-    if (!destExists || !destIsDir) {
-        destTokens.pop_back();
-
-        destDir = currentDirIdx;
-
-        if (!destTokens.empty()) {
-            std::string parentPath;
-
-            for (const std::string& tok : destTokens) parentPath += "/" + tok;
-
-            destDir = resolvePath(parentPath);
-        }
-
-        if (destDir == Specs::NULL_INDEX)
-            throw std::runtime_error("cp: Invalid destination path");
-    }
-
-    for (int32_t srcIdx : sources) {
-        Specs::Inode srcNode = controller.getInode(fs, sb, srcIdx);
-
-        std::string name =
-            (destIsDir || sources.size() > 1) ? srcNode.name : destName;
-
-        if (findChildInDirectory(destDir, name) != Specs::NULL_INDEX)
-            throw std::runtime_error("cp: File exists");
-
-        int32_t newIdx = controller.copyInode(fs, sb, srcIdx, destDir);
-
-        if (newIdx == Specs::NULL_INDEX)
-            throw std::runtime_error("cp: Out of space");
-
-        Specs::Inode newNode = controller.getInode(fs, sb, newIdx);
-        strncpy(newNode.name, name.c_str(), sizeof(newNode.name));
-
-        newNode.name[sizeof(newNode.name) - 1] = '\0';
-
-        controller.updateInode(fs, sb, newIdx, newNode);
-
-        addEntryToDirectory(destDir, newIdx);
-    }
-}
-
-void FileSystem::rm(const std::string& pattern) {
-    // Separate directory and filename pattern
-    size_t lastSlash = pattern.find_last_of('/');
-    std::string dirPath;
-    std::string filePattern;
-
-    if (lastSlash == std::string::npos) {
-        // No directory part, use current directory
-        dirPath = "";
-        filePattern = pattern;
-    }
-    else {
-        dirPath = pattern.substr(0, lastSlash);
-        filePattern = pattern.substr(lastSlash + 1);
-    }
-
-    // Resolve directory index, empty 'dirPath' means 'currentDirIdx'
-    int32_t dirIdx = dirPath.empty() ? currentDirIdx : resolvePath(dirPath);
-
-    if (dirIdx == Specs::NULL_INDEX) {
-        throw std::runtime_error("rm: No such directory: " + dirPath);
-    }
-
-    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
-
-    if (!dirNode.isDirectory) {
-        throw std::runtime_error("rm: Not a directory: " + dirPath);
-    }
-
-    std::vector<int32_t> matches = findAllMatches(dirIdx, filePattern);
-
-    if (matches.empty()) {
-        throw std::runtime_error("rm: No files match the pattern");
-    }
-
-    for (int32_t idx : matches) {
-        Specs::Inode node = controller.getInode(fs, sb, idx);
-
-        if (!node.isDirectory) {
-            unlinkInodeFromParent(idx);
-
-            deleteInodeRecursive(idx);
-        }
-    }
-}
-
-int32_t FileSystem::resolvePath(const std::string& path) {
-    if (path.empty()) return currentDirIdx;
-
-    // Root is always 0
-    if (path == "/") return 0;
-
-    std::vector<std::string> tokens = tokenize(path);
-
-    // Start from root if path starts with '/', otherwise start from 'currentDir'
-    int32_t searchIdx = (path[0] == '/') ? 0 : currentDirIdx;
-
-    if (tokens.empty()) return searchIdx;
-
-    for (const std::string& targetName : tokens) {
-        if (targetName == ".") {
-            // Stay in current directory
-            continue;
-        }
-
-        Specs::Inode currentInode = controller.getInode(fs, sb, searchIdx);
-
-        // Path components must be directories
-        if (!currentInode.isDirectory) {
-            return Specs::NULL_INDEX;
-        }
-
-        if (targetName == "..") {
-            searchIdx = currentInode.parent;
-
-            // Cap at root
-            if (searchIdx == Specs::NULL_INDEX) searchIdx = 0;
-
-            continue;
-        }
-
-        // Search children by name
-        bool found = false;
-        int32_t childIdx = currentInode.firstChild;
-
-        while (childIdx != Specs::NULL_INDEX) {
-            const Specs::Inode& child = controller.getInode(fs, sb, childIdx);
-
-            if (targetName == child.name) {
-                searchIdx = childIdx;
-
-                found = true;
-
-                break;
-            }
-
-            childIdx = child.nextSibling;
-        }
-
-        // Path broken
-        if (!found) return Specs::NULL_INDEX;
-    }
-
-    return searchIdx;
-}
-
-void FileSystem::sync() {
-    controller.sync(fs, sb);
-    fs.flush();
+    return dirCache.put(dirIdx, newDentry);
 }
 
 int32_t FileSystem::findChildInDirectory(int32_t dirIdx, const std::string& name) {
-    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
-    int32_t currentChildIdx = dirNode.firstChild;
+    Dentry* dentry = getOrPopulateDentry(dirIdx);
 
-    while (currentChildIdx != Specs::NULL_INDEX) {
-        Specs::Inode child = controller.getInode(fs, sb, currentChildIdx);
+    if (!dentry) {
+        return Specs::NULL_INDEX;
+    }
 
-        if (child.name == name) {
-            return currentChildIdx;
-        }
+    std::unordered_map<std::string, int32_t>::iterator it = dentry->nameToInode.find(name);
 
-        currentChildIdx = child.nextSibling;
+    if (it != dentry->nameToInode.end()) {
+        return it->second;
     }
 
     return Specs::NULL_INDEX;
 }
 
 std::string FileSystem::getFullPath(int32_t idx) {
-    if (idx == 0) return "/";
+    if (!idx) return "/";
 
-    std::string path = "";
+    if (idx == Specs::NULL_INDEX) return "";
 
     int32_t curr = idx;
+    std::string path = "";
 
     while (curr != 0 && curr != Specs::NULL_INDEX) {
-        const Specs::Inode& node = controller.getInode(fs, sb, curr);
-        path = "/" + std::string(node.name) + path;
+        InodeEntry* entry = controller.getInode(curr);
 
-        curr = node.parent;
+        if (!entry) break;
+
+        // Build path backwards
+        path = "/" + std::string(entry->node.name) + path;
+
+        // Move to parent
+        curr = entry->node.parent;
     }
 
     return path.empty() ? "/" : path;
@@ -513,181 +79,30 @@ std::string FileSystem::getFullPath(int32_t idx) {
 std::vector<int32_t> FileSystem::findAllMatches(int32_t dirIdx, const std::string& pattern) {
     std::vector<int32_t> matches;
 
-    Specs::Inode dirNode = controller.getInode(fs, sb, dirIdx);
-    int32_t currentChildIdx = dirNode.firstChild;
+    // Ensure directory is loaded into the RAM cache
+    Dentry* dentry = getOrPopulateDentry(dirIdx);
 
-    while (currentChildIdx != Specs::NULL_INDEX) {
-        Specs::Inode child = controller.getInode(fs, sb, currentChildIdx);
+    if (!dentry) {
+        return matches;
+    }
 
-        if (matchesPattern(pattern, child.name)) {
-            matches.push_back(currentChildIdx);
+    // Iterate through the cached name-to-inode map
+    std::unordered_map<std::string, int32_t>::iterator it;
+
+    for (it = dentry->nameToInode.begin(); it != dentry->nameToInode.end(); ++it) {
+        const std::string& fileName = it->first;
+        int32_t inodeIdx = it->second;
+
+        if (StringUtils::matchesPattern(pattern, fileName)) {
+            matches.push_back(inodeIdx);
         }
-
-        currentChildIdx = child.nextSibling;
     }
 
     return matches;
 }
 
-std::vector<std::string> FileSystem::tokenize(const std::string& path, char delimiter) {
-    std::vector<std::string> tokens;
-
-    std::stringstream ss(path);
-
-    std::string token;
-
-    while (std::getline(ss, token, delimiter)) {
-        if (!token.empty()) {
-            tokens.push_back(token);
-        }
-    }
-
-    return tokens;
-}
-
-void FileSystem::updateCurrentDir(int32_t newIdx) {
-    if (currentDirIdx != newIdx) {
-        prevDirIdx = currentDirIdx;
-
-        currentDirIdx = newIdx;
-    }
-}
-
-void FileSystem::addEntryToDirectory(int32_t parentIdx, int32_t childIdx) {
-    Specs::Inode parent = controller.getInode(fs, sb, parentIdx);
-
-    Specs::Inode child = controller.getInode(fs, sb, childIdx);
-    child.parent = parentIdx;
-
-    // Parent is currently empty
-    if (parent.firstChild == Specs::NULL_INDEX) {
-        parent.firstChild = childIdx;
-
-        child.nextSibling = Specs::NULL_INDEX;
-        child.prevSibling = Specs::NULL_INDEX;
-    }
-    // Parent already has children (push new child to the front)
-    else {
-        int32_t oldHeadIdx = parent.firstChild;
-
-        Specs::Inode oldHead = controller.getInode(fs, sb, oldHeadIdx);
-        child.nextSibling = oldHeadIdx;
-        child.prevSibling = Specs::NULL_INDEX;
-        oldHead.prevSibling = childIdx;
-        parent.firstChild = childIdx;
-
-        // Save the old head because its 'prevSibling' pointer changed
-        controller.updateInode(fs, sb, oldHeadIdx, oldHead);
-    }
-
-    controller.updateInode(fs, sb, childIdx, child);
-    controller.updateInode(fs, sb, parentIdx, parent);
-}
-
-void FileSystem::deleteInodeRecursive(int32_t idx) {
-    if (idx == Specs::NULL_INDEX) return;
-
-    Specs::Inode node = controller.getInode(fs, sb, idx);
-
-    // If it's a directory, delete all children first
-    int32_t currentChild = node.firstChild;
-
-    while (currentChild != Specs::NULL_INDEX) {
-        // We need to fetch the next sibling before deleting the child
-        Specs::Inode childNode = controller.getInode(fs, sb, currentChild);
-        int32_t next = childNode.nextSibling;
-
-        deleteInodeRecursive(currentChild);
-
-        currentChild = next;
-    }
-
-    // This handles both direct and indirect blocks internally
-    controller.freeInode(fs, sb, idx);
-}
-
-void FileSystem::unlinkInodeFromParent(int32_t targetIdx) {
-    Specs::Inode target = controller.getInode(fs, sb, targetIdx);
-    int32_t pIdx = target.parent;
-
-    if (pIdx == Specs::NULL_INDEX) return;
-
-    Specs::Inode parent = controller.getInode(fs, sb, pIdx);
-
-    // If I am the head child, move the parent's pointer to my next sibling
-    if (parent.firstChild == targetIdx) {
-        parent.firstChild = target.nextSibling;
-    }
-
-    // If someone is after me, tell them to point back to my predecessor
-    if (target.nextSibling != Specs::NULL_INDEX) {
-        Specs::Inode nextSib = controller.getInode(fs, sb, target.nextSibling);
-        nextSib.prevSibling = target.prevSibling;
-
-        controller.updateInode(fs, sb, target.nextSibling, nextSib);
-    }
-
-    // If someone is before me, tell them to point forward to my successor
-    if (target.prevSibling != Specs::NULL_INDEX) {
-        Specs::Inode prevSib = controller.getInode(fs, sb, target.prevSibling);
-        prevSib.nextSibling = target.nextSibling;
-
-        controller.updateInode(fs, sb, target.prevSibling, prevSib);
-    }
-
-    target.parent = Specs::NULL_INDEX;
-
-    target.nextSibling = Specs::NULL_INDEX;
-    target.prevSibling = Specs::NULL_INDEX;
-
-    // Finalize the parent's new state
-    controller.updateInode(fs, sb, pIdx, parent);
-}
-
-bool FileSystem::matchesPattern(const std::string& pattern, const std::string& name) {
-    size_t n = name.length();
-    size_t p = pattern.length();
-
-    size_t i = 0, j = 0, match = 0, startIndex = std::string::npos;
-
-    while (i < n) {
-        // If characters match or pattern has '?'
-        if (j < p && (pattern[j] == '?' || pattern[j] == name[i])) {
-            ++i;
-            ++j;
-        }
-        // If pattern has '*', mark the position and try to match 0 characters
-        else if (j < p && pattern[j] == '*') {
-            startIndex = j;
-
-            match = i;
-
-            ++j;
-        }
-        // If last match was a '*', backtrack and try matching one more character
-        else if (startIndex != std::string::npos) {
-            j = startIndex + 1;
-            match++;
-
-            i = match;
-        }
-        else {
-            return false;
-        }
-    }
-
-    // Handle trailing '*' in pattern (e.g., "file**")
-    while (j < p && pattern[j] == '*') {
-        ++j;
-    }
-
-    return j == p;
-}
-
-void FileSystem::attachBlockToInode(Specs::Inode& node,
-    int32_t inodeIdx, int32_t blockIdx) {
-    // Nudge the numerator so that anything more than a perfect multiple
-    // of the block size gets pushed over the edge to the next integer
+void FileSystem::attachBlockToInode(Specs::Inode& node, int32_t inodeIdx, int32_t blockIdx) {
+    // Calculate the logical block index for the new block
     uint32_t currentBlockCount = (node.size == 0) ?
         0 : (node.size + sb.blockSize - 1) / sb.blockSize;
 
@@ -695,31 +110,210 @@ void FileSystem::attachBlockToInode(Specs::Inode& node,
         node.directBlocks[currentBlockCount] = blockIdx;
     }
     else {
-        // We are in the indirect zone
-        if (node.indirectBlock == Specs::NULL_INDEX) {
-            // Allocate the "table" block itself first
-            node.indirectBlock = controller.allocateBlock(fs, sb);
-            std::vector<int32_t> emptyTable(sb.blockSize / sizeof(int32_t), Specs::NULL_INDEX);
+        uint32_t ptrsPerBlock = sb.blockSize / sizeof(int32_t);
 
-            controller.writeBlock(fs, sb, node.indirectBlock, reinterpret_cast<char*>(emptyTable.data()));
+        uint32_t indirectTableIdx = currentBlockCount - 32;
+
+        if (indirectTableIdx >= ptrsPerBlock) {
+            throw std::runtime_error("File exceeds maximum size (indirect block full).");
         }
 
-        std::vector<int32_t> table(sb.blockSize / sizeof(int32_t));
+        if (node.indirectBlock == Specs::NULL_INDEX) {
+            int32_t tableBlockIdx = controller.allocateBlock();
 
-        controller.readBlock(fs, sb, node.indirectBlock, reinterpret_cast<char*>(table.data()));
-        table[currentBlockCount - 32] = blockIdx;
+            if (tableBlockIdx == Specs::NULL_INDEX) {
+                throw std::runtime_error("Disk full: failed to allocate indirect block.");
+            }
 
-        controller.writeBlock(fs, sb, node.indirectBlock, reinterpret_cast<char*>(table.data()));
+            node.indirectBlock = tableBlockIdx;
+
+            // Zero-out the new table block immediately
+            std::vector<int32_t> emptyTable(ptrsPerBlock, Specs::NULL_INDEX);
+
+            controller.writeBlock(node.indirectBlock, reinterpret_cast<const char*>(emptyTable.data()));
+        }
+
+        std::vector<int32_t> table(ptrsPerBlock);
+
+        controller.readBlock(node.indirectBlock, reinterpret_cast<char*>(table.data()));
+        table[indirectTableIdx] = blockIdx;
+
+        controller.writeBlock(node.indirectBlock, reinterpret_cast<const char*>(table.data()));
     }
 
-    // Finalize the inode state in the cache
-    controller.updateInode(fs, sb, inodeIdx, node);
+    controller.updateInode(inodeIdx, node);
 }
 
-bool FileSystem::isDirectoryEmpty(int32_t dirIdx) {
-    Specs::Inode node = controller.getInode(fs, sb, dirIdx);
+void FileSystem::updateCurrentDir(int32_t newIdx) {
+    if (newIdx == Specs::NULL_INDEX) return;
 
-    return node.firstChild == Specs::NULL_INDEX;
+    InodeEntry* entry = controller.getInode(newIdx);
+
+    if (!entry || !entry->node.isDirectory) {
+        throw std::runtime_error("Path is not a directory.");
+    }
+
+    if (currentDirIdx != newIdx) {
+        prevDirIdx = currentDirIdx;
+
+        currentDirIdx = newIdx;
+    }
+}
+
+// --- TREE MANIPULATION HELPERS ---
+void FileSystem::addEntryToDirectory(int32_t parentIdx, int32_t childIdx) {
+    InodeEntry* parentEntry = controller.getInode(parentIdx);
+
+    InodeEntry* childEntry = controller.getInode(childIdx);
+
+    if (!childEntry || !parentEntry) return;
+
+    Specs::Inode& childNode = childEntry->node;
+    Specs::Inode& parentNode = parentEntry->node;
+
+    // Set the basic parent linkage
+    childNode.parent = parentIdx;
+
+    // Update the doubly-linked list of siblings
+    if (parentNode.firstChild == Specs::NULL_INDEX) {
+        // Parent is currently empty
+        parentNode.firstChild = childIdx;
+
+        childNode.nextSibling = Specs::NULL_INDEX;
+        childNode.prevSibling = Specs::NULL_INDEX;
+    }
+    else {
+        // Parent already has children (push new child to the front)
+        int32_t oldHeadIdx = parentNode.firstChild;
+
+        InodeEntry* oldHeadEntry = controller.getInode(oldHeadIdx);
+
+        if (oldHeadEntry) {
+            childNode.nextSibling = oldHeadIdx;
+            childNode.prevSibling = Specs::NULL_INDEX;
+            oldHeadEntry->node.prevSibling = childIdx;
+
+            controller.updateInode(oldHeadIdx, oldHeadEntry->node);
+        }
+
+        parentNode.firstChild = childIdx;
+    }
+
+    // If this directory's name-map is in RAM, we must add the new entry immediately
+    Dentry* cachedDir = dirCache.get(parentIdx);
+
+    if (cachedDir) {
+        cachedDir->nameToInode[childNode.name] = childIdx;
+    }
+
+    controller.updateInode(childIdx, childNode);
+    controller.updateInode(parentIdx, parentNode);
+}
+
+void FileSystem::deleteInodeRecursive(int32_t idx) {
+    if (!idx || idx == Specs::NULL_INDEX) {
+        // Never recursively delete the root
+        return;
+    }
+
+    InodeEntry* entry = controller.getInode(idx);
+
+    if (!entry) return;
+
+    // If it's a directory, clean out the children first
+    if (entry->node.isDirectory) {
+        int32_t currentChildIdx = entry->node.firstChild;
+
+        while (currentChildIdx != Specs::NULL_INDEX) {
+            // We must fetch the sibling pointer BEFORE deleting the child
+            InodeEntry* childEntry = controller.getInode(currentChildIdx);
+
+            if (!childEntry) break;
+
+            int32_t nextSiblingIdx = childEntry->node.nextSibling;
+
+            // Recurse down
+            deleteInodeRecursive(currentChildIdx);
+
+            currentChildIdx = nextSiblingIdx;
+        }
+
+        // Since the directory is being deleted, its name-map is now garbage
+        dirCache.remove(idx);
+    }
+
+    // This handles both direct and indirect blocks internally
+    controller.freeInode(idx);
+}
+
+void FileSystem::unlinkInodeFromParent(int32_t targetIdx) {
+    InodeEntry* targetEntry = controller.getInode(targetIdx);
+
+    if (!targetEntry) return;
+
+    Specs::Inode& targetNode = targetEntry->node;
+    int32_t pIdx = targetNode.parent;
+
+    if (pIdx == Specs::NULL_INDEX) return;
+
+    InodeEntry* parentEntry = controller.getInode(pIdx);
+
+    if (!parentEntry) return;
+
+    Specs::Inode& parentNode = parentEntry->node;
+
+    // If I am the head child, move the parent's pointer to my next sibling
+    if (parentNode.firstChild == targetIdx) {
+        parentNode.firstChild = targetNode.nextSibling;
+    }
+
+    // If someone is after me, tell them to point back to my predecessor
+    if (targetNode.nextSibling != Specs::NULL_INDEX) {
+        InodeEntry* nextSibEntry = controller.getInode(targetNode.nextSibling);
+
+        if (nextSibEntry) {
+            nextSibEntry->node.prevSibling = targetNode.prevSibling;
+
+            controller.updateInode(targetNode.nextSibling, nextSibEntry->node);
+        }
+    }
+
+    // If someone is before me, tell them to point forward to my successor
+    if (targetNode.prevSibling != Specs::NULL_INDEX) {
+        InodeEntry* prevSibEntry = controller.getInode(targetNode.prevSibling);
+
+        if (prevSibEntry) {
+            prevSibEntry->node.nextSibling = targetNode.nextSibling;
+
+            controller.updateInode(targetNode.prevSibling, prevSibEntry->node);
+        }
+    }
+
+    Dentry* cachedDir = dirCache.get(pIdx);
+
+    if (cachedDir) {
+        cachedDir->nameToInode.erase(targetNode.name);
+    }
+
+    // Reset target linkage
+    targetNode.parent = Specs::NULL_INDEX;
+
+    targetNode.nextSibling = Specs::NULL_INDEX;
+    targetNode.prevSibling = Specs::NULL_INDEX;
+
+    controller.updateInode(pIdx, parentNode);
+    controller.updateInode(targetIdx, targetNode);
+}
+
+// --- EDGE CASE VALIDATORS ---
+bool FileSystem::isDirectoryEmpty(int32_t dirIdx) {
+    InodeEntry* entry = controller.getInode(dirIdx);
+
+    if (!entry || !entry->node.isDirectory) {
+        return false;
+    }
+
+    return entry->node.firstChild == Specs::NULL_INDEX;
 }
 
 bool FileSystem::isValidFilename(const std::string& name) {
