@@ -4,6 +4,259 @@
 #include "file_system.hpp"
 #include "string_utils.hpp"
 
+// --- DIRECTORY OPERATIONS ---
+void FileSystem::cd(const std::string& path) {
+    if (path.empty()) {
+        std::cout << getFullPath(currentDirIdx) << std::endl;
+
+        return;
+    }
+
+    if (path == "~") {
+        updateCurrentDir(0);
+
+        return;
+    }
+
+    // Toggle to previous directory
+    if (path == "-") {
+        if (prevDirIdx == Specs::NULL_INDEX) {
+            throw std::runtime_error("[cd] OLDPWD not set.");
+        }
+
+        std::cout << getFullPath(prevDirIdx) << std::endl;
+        updateCurrentDir(prevDirIdx);
+
+        return;
+    }
+
+    // Resolve the provided path (handles absolute, relative, '.', and '..')
+    int32_t targetIdx = resolvePath(path);
+
+    if (targetIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("[cd] No such file or directory.");
+    }
+
+    try {
+        updateCurrentDir(targetIdx);
+    }
+    catch (const std::runtime_error& e) {
+        throw std::runtime_error("[cd] " + std::string(e.what()));
+    }
+}
+
+void FileSystem::ls(const std::string& path) {
+    int32_t targetDirIdx = Specs::NULL_INDEX;
+
+    // Default to "show everything"
+    std::string pattern = "*";
+
+    if (path.empty()) {
+        targetDirIdx = currentDirIdx;
+    }
+    else {
+        // Check if the input contains wildcards
+        if (path.find_first_of("*?") != std::string::npos) {
+            size_t lastSlash = path.find_last_of('/');
+
+            if (lastSlash == std::string::npos) {
+                // For example, "ls *.txt" (current directory, pattern is "*.txt")
+                targetDirIdx = currentDirIdx;
+
+                pattern = path;
+            }
+            else {
+                // For example, "ls /home/user/*.cpp"
+                std::string dirPart = path.substr(0, lastSlash);
+
+                // Handle leading slash root case
+                if (dirPart.empty()) dirPart = "/";
+
+                pattern = path.substr(lastSlash + 1);
+                targetDirIdx = resolvePath(dirPart);
+            }
+        }
+        else {
+            targetDirIdx = resolvePath(path);
+
+            // If the user points to a specific file, just show that file
+            InodeEntry* entry = controller.getInode(targetDirIdx);
+
+            if (entry && !entry->node.isDirectory) {
+                std::cout << "f\t" << entry->node.size << "\t" << entry->node.name << "\n";
+
+                return;
+            }
+        }
+    }
+
+    if (targetDirIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("[ls] No such file or directory.");
+    }
+
+    InodeEntry* dirEntry = controller.getInode(targetDirIdx);
+
+    if (!dirEntry || !dirEntry->node.isDirectory) {
+        throw std::runtime_error("[ls] Not a directory.");
+    }
+
+    std::vector<int32_t> matches = findAllMatches(targetDirIdx, pattern);
+
+    if (matches.empty()) return;
+
+    std::cout << "Type\tSize\tName\n";
+
+    std::cout << "-------------------------------------------\n";
+
+    for (int32_t inodeIdx : matches) {
+        InodeEntry* entry = controller.getInode(inodeIdx);
+
+        if (!entry) continue;
+
+        char type = entry->node.isDirectory ? 'd' : 'f';
+        std::cout << type << "\t" << entry->node.size << "\t" << entry->node.name << "\n";
+    }
+
+    std::cout << std::endl;
+}
+
+void FileSystem::mkdir(const std::string& path) {
+    if (path.empty()) {
+        throw std::runtime_error("[mkdir] Missing operand.");
+    }
+
+    std::vector<std::string> tokens = StringUtils::tokenize(path);
+
+    if (tokens.empty()) {
+        throw std::runtime_error("[mkdir] Invalid path.");
+    }
+
+    std::string newDirName = tokens.back();
+    tokens.pop_back();
+
+    if (!isValidFilename(newDirName)) {
+        throw std::runtime_error("[mkdir] Invalid directory name.");
+    }
+
+    std::string parentPath = (path[0] == '/') ? "/" : "";
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        parentPath += tokens[i] + (i == tokens.size() - 1 ? "" : "/");
+    }
+
+    int32_t parentIdx = resolvePath(parentPath);
+
+    if (parentIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("[mkdir] Parent directory does not exist.");
+    }
+
+    if (findChildInDirectory(parentIdx, newDirName) != Specs::NULL_INDEX) {
+        throw std::runtime_error("[mkdir] File or directory already exists.");
+    }
+
+    int32_t newDirIdx = controller.allocateInode();
+
+    if (newDirIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("[mkdir] Disk full.");
+    }
+
+    InodeEntry* entry = controller.getInode(newDirIdx);
+    Specs::Inode& node = entry->node;
+    node.isDirectory = true;
+    node.size = 0;
+
+    node.firstChild = Specs::NULL_INDEX;
+    node.parent = parentIdx;
+
+    node.nextSibling = Specs::NULL_INDEX;
+    node.prevSibling = Specs::NULL_INDEX;
+    std::strncpy(node.name, newDirName.c_str(), sizeof(node.name) - 1);
+
+    node.name[sizeof(node.name) - 1] = '\0';
+
+    for (int i = 0; i < 32; ++i) node.directBlocks[i] = Specs::NULL_INDEX;
+
+    node.indirectBlock = Specs::NULL_INDEX;
+
+    addEntryToDirectory(parentIdx, newDirIdx);
+}
+
+void FileSystem::rmdir(const std::string& path) {
+    if (path.empty()) {
+        throw std::runtime_error("[rmdir] Missing operand.");
+    }
+
+    int32_t targetIdx = resolvePath(path);
+
+    if (targetIdx == Specs::NULL_INDEX) {
+        throw std::runtime_error("[rmdir] No such file or directory.");
+    }
+
+    if (targetIdx == 0) {
+        throw std::runtime_error("[rmdir] Cannot remove root directory.");
+    }
+
+    InodeEntry* entry = controller.getInode(targetIdx);
+
+    if (!entry || !entry->node.isDirectory) {
+        throw std::runtime_error("[rmdir] Not a directory.");
+    }
+
+    if (!isDirectoryEmpty(targetIdx)) {
+        throw std::runtime_error("[rmdir] Directory not empty.");
+    }
+
+    unlinkInodeFromParent(targetIdx);
+
+    deleteInodeRecursive(targetIdx);
+}
+
+// --- NAVIGATION & MAINTENANCE ---
+int32_t FileSystem::resolvePath(const std::string& path) {
+    if (path.empty()) return currentDirIdx;
+
+    std::vector<std::string> tokens = StringUtils::tokenize(path);
+
+    // Determine starting point
+    int32_t currentIdx = (path[0] == '/') ? 0 : currentDirIdx;
+
+    if (tokens.empty()) return currentIdx;
+
+    for (const std::string& tok : tokens) {
+        if (tok == ".") continue;
+
+        InodeEntry* entry = controller.getInode(currentIdx);
+
+        if (!entry || !entry->node.isDirectory) {
+            return Specs::NULL_INDEX;
+        }
+
+        if (tok == "..") {
+            currentIdx = entry->node.parent;
+
+            if (currentIdx == Specs::NULL_INDEX) currentIdx = 0;
+
+            continue;
+        }
+
+        // Use our high-speed cached lookup
+        int32_t nextIdx = findChildInDirectory(currentIdx, tok);
+
+        if (nextIdx == Specs::NULL_INDEX) {
+            // Path segment not found
+            return Specs::NULL_INDEX;
+        }
+
+        currentIdx = nextIdx;
+    }
+
+    return currentIdx;
+}
+
+void FileSystem::sync() {
+    controller.sync();
+}
+
 // --- DATA HELPERS ---
 Dentry* FileSystem::getOrPopulateDentry(int32_t dirIdx) {
     Dentry* cached = dirCache.get(dirIdx);
