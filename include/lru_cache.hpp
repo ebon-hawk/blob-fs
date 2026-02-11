@@ -25,23 +25,10 @@ public:
 
     size_t size() const { return cacheMap.size(); }
 
-    struct CacheEntry {
-        Value value;
-        typename std::list<Key>::iterator listIt;
-    };
-
-    typename std::unordered_map<Key, CacheEntry>::iterator begin() {
-        return cacheMap.begin();
-    }
-
-    typename std::unordered_map<Key, CacheEntry>::iterator end() {
-        return cacheMap.end();
-    }
-
     Value* get(const Key& key) {
         typename std::unordered_map<Key, CacheEntry>::iterator it = cacheMap.find(key);
 
-        if (cacheMap.end() == it) return nullptr;
+        if (it == cacheMap.end()) return nullptr;
 
         lruList.erase(it->second.listIt);
         lruList.push_front(key);
@@ -77,7 +64,7 @@ public:
     Value* put(const Key& key, const Value& value) {
         typename std::unordered_map<Key, CacheEntry>::iterator it = cacheMap.find(key);
 
-        if (cacheMap.end() != it) {
+        if (it != cacheMap.end()) {
             it->second.value = value;
             lruList.erase(it->second.listIt);
             lruList.push_front(key);
@@ -93,14 +80,13 @@ public:
 
         cacheMap[key] = { value, lruList.begin() };
 
-        // Return newly created
         return &(cacheMap[key].value);
     }
 
     void remove(const Key& key) {
         typename std::unordered_map<Key, CacheEntry>::iterator it = cacheMap.find(key);
 
-        if (cacheMap.end() != it) {
+        if (it != cacheMap.end()) {
             if (handler && !handler->onEvict(key, it->second.value)) {
                 // Abort removal
                 return;
@@ -111,6 +97,21 @@ public:
             cacheMap.erase(it);
         }
     }
+
+    template <typename Func>
+    void forEach(Func func) {
+        typename std::unordered_map<Key, CacheEntry>::iterator it = cacheMap.begin();
+
+        for (; it != cacheMap.end(); ++it) {
+            func(it->first, it->second.value);
+        }
+    }
+
+public:
+    struct CacheEntry {
+        Value value;
+        typename std::list<Key>::iterator listIt;
+    };
 
 private:
     bool evict() {
@@ -137,4 +138,4 @@ private:
     ICacheEventHandler<Key, Value>* handler;
 };
 
-#endif // LRU_CACHE_HPP
+#endif

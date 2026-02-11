@@ -11,4 +11,4 @@ namespace StringUtils {
     std::vector<std::string> tokenize(const std::string& input, char delimiter = '/');
 }
 
-#endif // STRING_UTILS_HPP
+#endif

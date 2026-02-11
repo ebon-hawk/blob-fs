@@ -2,48 +2,56 @@
 #define SPECS_HPP
 
 #include <cstdint>
+#include <string>
+#include <unordered_map>
 
 namespace Specs {
+    // --- SYSTEM CONSTANTS ---
     constexpr int32_t  NULL_INDEX = -1;
     constexpr uint32_t BLOCK_SIZE = 4096;
+    constexpr uint32_t DIRECT_BLOCKS_COUNT = 32;
     constexpr uint32_t INODE_SIZE = 256;
-    constexpr uint32_t MAGIC_NUMBER = 0x5346;
+    constexpr uint32_t MAGIC_NUMBER = 0x424C4F42;
+    constexpr uint32_t MAX_NAME_LEN = 64;
 
-    inline uint32_t bitsToBytes(uint32_t bits) {
-        return (bits + 7) / 8;
-    }
+    // --- PADDING CONSTANTS ---
+    constexpr uint32_t INODE_PADDING_SIZE = 36;
+    constexpr uint32_t SB_PADDING_SIZE = 20;
 
     struct Superblock {
+        // Unique signature to identify the file as a valid "BLOB" system
         uint32_t magicNumber;
 
-        // Size of a single data block in bytes
-        uint32_t blockSize;
+        // Total physical file size limit
+        uint64_t maxDiskSize;
 
-        // Maximum allowed size for a single file in bytes
-        uint32_t maxFileSize;
-
-        // The total capacity of the inode table
+        // Max number of directories/files allowed
         uint32_t inodeCount;
 
-        // The total number of data blocks available for file content;
-        // matches the number of bits in the data block bitmap
-        uint32_t dataBlockCount;
+        // Total number of addressable blocks in the data region
+        uint32_t blockCount;
+
+        // Size of a single block in the data region
+        uint32_t blockSize;
 
         // Byte offset where the inode usage bitmap starts
         uint32_t inodeBitmapOffset;
 
-        // Byte offset where the data block usage bitmap starts
+        // Byte offset where the block usage bitmap starts
         uint32_t blockBitmapOffset;
 
-        // Byte offset where the array of inode structs begins
+        // Absolute file offset to the array of fixed-size inode structures
         uint32_t inodeTableOffset;
 
-        // Byte offset where the raw file data storage begins
+        // Absolute file offset to where the actual file content begins
         uint32_t dataRegionOffset;
+
+        // Reserved space for future expansion (or alignment to a 64-byte header size)
+        uint8_t padding[SB_PADDING_SIZE];
     };
 
     struct Inode {
-        char name[64];
+        char name[MAX_NAME_LEN];
         uint8_t isDirectory;
         uint32_t size;
 
@@ -53,13 +61,34 @@ namespace Specs {
         int32_t nextSibling;
         int32_t prevSibling;
 
-        int32_t directBlocks[32];
+        int32_t directBlocks[DIRECT_BLOCKS_COUNT];
         int32_t indirectBlock;
-
-        uint8_t padding[36];
+        uint8_t padding[INODE_PADDING_SIZE];
     };
 
-    static_assert(sizeof(Inode) == INODE_SIZE, "Inode must be exactly 256 bytes.");
+    // Helper to calculate bitmap size in bytes
+    inline uint32_t bitsToBytes(uint32_t bits) {
+        return (bits + 7) / 8;
+    }
+
+    struct PathQuery {
+        // Filename or wildcard
+        std::string pattern = "*";
+
+        // Valid only if not a wildcard
+        int32_t exactIdx = Specs::NULL_INDEX;
+
+        // Directory to search in
+        int32_t dirIdx = Specs::NULL_INDEX;
+
+        // Whether wildcard logic was used
+        bool isWildcard = false;
+    };
+
+    struct Dentry {
+        // Maps filename to inode index
+        std::unordered_map<std::string, int32_t> nameToInode;
+    };
 }
 
-#endif // SPECS_HPP
+#endif
