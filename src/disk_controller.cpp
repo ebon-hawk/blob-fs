@@ -211,164 +211,6 @@ bool DiskController::onEvict(const int32_t& key, InodeEntry& value) {
     }
 }
 
-// --- DISK I/O ---
-uint32_t DiskController::getBlockOffset(int32_t blockIdx) const {
-    return sb.dataRegionOffset + (blockIdx * sb.blockSize);
-}
-
-uint32_t DiskController::getInodeOffset(int32_t inodeIdx) const {
-    return sb.inodeTableOffset + (inodeIdx * sizeof(Specs::Inode));
-}
-
-Specs::Inode DiskController::readInodeFromDisk(int32_t inodeIdx) {
-    if (inodeIdx < 0 || inodeIdx >= (int32_t)sb.inodeCount) {
-        throw std::out_of_range("Invalid inode index.");
-    }
-
-    Specs::Inode node;
-    uint32_t offset = getInodeOffset(inodeIdx);
-
-    fs.seekg(offset, std::ios::beg);
-
-    fs.read(reinterpret_cast<char*>(&node), sizeof(Specs::Inode));
-
-    if (!fs) {
-        throw std::runtime_error("Disk I/O failure.");
-    }
-
-    return node;
-}
-
-void DiskController::writeInodeToDisk(int32_t inodeIdx, const Specs::Inode& node) {
-    if (inodeIdx < 0 || inodeIdx >= (int32_t)sb.inodeCount) {
-        throw std::out_of_range("Invalid inode index.");
-    }
-
-    uint32_t offset = getInodeOffset(inodeIdx);
-
-    fs.seekp(offset, std::ios::beg);
-    fs.write(reinterpret_cast<const char*>(&node), sizeof(Specs::Inode));
-
-    if (!fs) {
-        throw std::runtime_error("Disk I/O failure.");
-    }
-}
-
-// --- BITMAP MANAGEMENT ---
-int32_t DiskController::allocateResource(std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint, bool& dirtyFlag) {
-    int32_t idx = findFreeBit(bitmap, totalCount, hint);
-
-    if (idx != Specs::NULL_INDEX) {
-        toggleBit(bitmap, idx, true);
-
-        dirtyFlag = true;
-    }
-
-    return idx;
-}
-
-int32_t DiskController::findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint) {
-    uint32_t startByte = (hint / 8);
-    uint32_t totalBytes = bitmap.size();
-
-    // Search from hint to end of bitmap
-    for (uint32_t i = startByte; i < totalBytes; ++i) {
-        // Only check individual bits if the byte isn't full
-        if (bitmap[i] != 0xFF) {
-            for (int bit = 0; bit < 8; ++bit) {
-                int32_t currentIdx = (i * 8) + bit;
-
-                // Safety check
-                if (currentIdx >= (int32_t)totalCount) {
-                    break;
-                }
-
-                // Skip bits before the exact hint within the 'startByte'
-                if (currentIdx < (int32_t)hint) {
-                    continue;
-                }
-
-                if (!(bitmap[i] & (1 << bit))) {
-                    // Update hint for next time
-                    hint = currentIdx;
-
-                    return currentIdx;
-                }
-            }
-        }
-    }
-
-    // Wrap-around (search from beginning to hint)
-    for (uint32_t i = 0; i <= startByte; ++i) {
-        if (bitmap[i] != 0xFF) {
-            for (int bit = 0; bit < 8; ++bit) {
-                int32_t currentIdx = (i * 8) + bit;
-
-                // We stop once we reach the original hint
-                if (currentIdx >= (int32_t)hint || currentIdx >= (int32_t)totalCount) {
-                    break;
-                }
-
-                if (!(bitmap[i] & (1 << bit))) {
-                    hint = currentIdx;
-
-                    return currentIdx;
-                }
-            }
-        }
-    }
-
-    return Specs::NULL_INDEX;
-}
-
-void DiskController::freeBlock(int32_t blockIdx) {
-    if (blockIdx == Specs::NULL_INDEX) {
-        return;
-    }
-
-    if (blockIdx < 0 || blockIdx >= (int32_t)sb.blockCount) {
-        throw std::out_of_range("Block index out of range.");
-    }
-
-    toggleBit(blockBitmap, blockIdx, false);
-
-    blockBitmapDirty = true;
-
-    if (blockIdx < (int32_t)lastBlockHint) {
-        lastBlockHint = (uint32_t)blockIdx;
-    }
-}
-
-void DiskController::loadBitmaps() {
-    inodeBitmap.resize(Specs::bitsToBytes(sb.inodeCount));
-
-    fs.seekg(sb.inodeBitmapOffset, std::ios::beg);
-
-    if (!fs.read(reinterpret_cast<char*>(inodeBitmap.data()), inodeBitmap.size())) {
-        throw std::runtime_error("Failed to load inode bitmap.");
-    }
-
-    blockBitmap.resize(Specs::bitsToBytes(sb.blockCount));
-    fs.seekg(sb.blockBitmapOffset, std::ios::beg);
-
-    if (!fs.read(reinterpret_cast<char*>(blockBitmap.data()), blockBitmap.size())) {
-        throw std::runtime_error("Failed to load block bitmap.");
-    }
-}
-
-void DiskController::toggleBit(std::vector<uint8_t>& bitmap, int32_t idx, bool set) {
-    if (idx < 0 || idx >= (int32_t)(bitmap.size() * 8)) {
-        throw std::out_of_range("Bitmap index out of range.");
-    }
-
-    if (set) {
-        bitmap[idx / 8] |= (1 << (idx % 8));
-    }
-    else {
-        bitmap[idx / 8] &= ~(1 << (idx % 8));
-    }
-}
-
 // --- FILE GROWTH ---
 bool DiskController::canGrowFile(const Specs::Inode& node, uint32_t bytesToAdd) {
     if (bytesToAdd == 0) {
@@ -631,4 +473,162 @@ void DiskController::freeIndirectData(int32_t idx) {
     }
 
     freeBlock(idx);
+}
+
+// --- DISK I/O ---
+uint32_t DiskController::getBlockOffset(int32_t blockIdx) const {
+    return sb.dataRegionOffset + (blockIdx * sb.blockSize);
+}
+
+uint32_t DiskController::getInodeOffset(int32_t inodeIdx) const {
+    return sb.inodeTableOffset + (inodeIdx * sizeof(Specs::Inode));
+}
+
+Specs::Inode DiskController::readInodeFromDisk(int32_t inodeIdx) {
+    if (inodeIdx < 0 || inodeIdx >= (int32_t)sb.inodeCount) {
+        throw std::out_of_range("Invalid inode index.");
+    }
+
+    Specs::Inode node;
+    uint32_t offset = getInodeOffset(inodeIdx);
+
+    fs.seekg(offset, std::ios::beg);
+
+    fs.read(reinterpret_cast<char*>(&node), sizeof(Specs::Inode));
+
+    if (!fs) {
+        throw std::runtime_error("Disk I/O failure.");
+    }
+
+    return node;
+}
+
+void DiskController::writeInodeToDisk(int32_t inodeIdx, const Specs::Inode& node) {
+    if (inodeIdx < 0 || inodeIdx >= (int32_t)sb.inodeCount) {
+        throw std::out_of_range("Invalid inode index.");
+    }
+
+    uint32_t offset = getInodeOffset(inodeIdx);
+
+    fs.seekp(offset, std::ios::beg);
+    fs.write(reinterpret_cast<const char*>(&node), sizeof(Specs::Inode));
+
+    if (!fs) {
+        throw std::runtime_error("Disk I/O failure.");
+    }
+}
+
+// --- BITMAP MANAGEMENT ---
+int32_t DiskController::allocateResource(std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint, bool& dirtyFlag) {
+    int32_t idx = findFreeBit(bitmap, totalCount, hint);
+
+    if (idx != Specs::NULL_INDEX) {
+        toggleBit(bitmap, idx, true);
+
+        dirtyFlag = true;
+    }
+
+    return idx;
+}
+
+int32_t DiskController::findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint) {
+    uint32_t startByte = (hint / 8);
+    uint32_t totalBytes = bitmap.size();
+
+    // Search from hint to end of bitmap
+    for (uint32_t i = startByte; i < totalBytes; ++i) {
+        // Only check individual bits if the byte isn't full
+        if (bitmap[i] != 0xFF) {
+            for (int bit = 0; bit < 8; ++bit) {
+                int32_t currentIdx = (i * 8) + bit;
+
+                // Safety check
+                if (currentIdx >= (int32_t)totalCount) {
+                    break;
+                }
+
+                // Skip bits before the exact hint within the 'startByte'
+                if (currentIdx < (int32_t)hint) {
+                    continue;
+                }
+
+                if (!(bitmap[i] & (1 << bit))) {
+                    // Update hint for next time
+                    hint = currentIdx;
+
+                    return currentIdx;
+                }
+            }
+        }
+    }
+
+    // Wrap-around (search from beginning to hint)
+    for (uint32_t i = 0; i <= startByte; ++i) {
+        if (bitmap[i] != 0xFF) {
+            for (int bit = 0; bit < 8; ++bit) {
+                int32_t currentIdx = (i * 8) + bit;
+
+                // We stop once we reach the original hint
+                if (currentIdx >= (int32_t)hint || currentIdx >= (int32_t)totalCount) {
+                    break;
+                }
+
+                if (!(bitmap[i] & (1 << bit))) {
+                    hint = currentIdx;
+
+                    return currentIdx;
+                }
+            }
+        }
+    }
+
+    return Specs::NULL_INDEX;
+}
+
+void DiskController::freeBlock(int32_t blockIdx) {
+    if (blockIdx == Specs::NULL_INDEX) {
+        return;
+    }
+
+    if (blockIdx < 0 || blockIdx >= (int32_t)sb.blockCount) {
+        throw std::out_of_range("Block index out of range.");
+    }
+
+    toggleBit(blockBitmap, blockIdx, false);
+
+    blockBitmapDirty = true;
+
+    if (blockIdx < (int32_t)lastBlockHint) {
+        lastBlockHint = (uint32_t)blockIdx;
+    }
+}
+
+void DiskController::loadBitmaps() {
+    inodeBitmap.resize(Specs::bitsToBytes(sb.inodeCount));
+
+    fs.seekg(sb.inodeBitmapOffset, std::ios::beg);
+
+    if (!fs.read(reinterpret_cast<char*>(inodeBitmap.data()), inodeBitmap.size())) {
+        throw std::runtime_error("Failed to load inode bitmap.");
+    }
+
+    blockBitmap.resize(Specs::bitsToBytes(sb.blockCount));
+    fs.seekg(sb.blockBitmapOffset, std::ios::beg);
+
+    if (!fs.read(reinterpret_cast<char*>(blockBitmap.data()), blockBitmap.size())) {
+        throw std::runtime_error("Failed to load block bitmap.");
+    }
+}
+
+void DiskController::toggleBit(std::vector<uint8_t>& bitmap, int32_t idx, bool set) {
+    if (idx < 0 || idx >= (int32_t)(bitmap.size() * 8)) {
+        throw std::out_of_range("Bitmap index out of range.");
+    }
+
+    if (set) {
+        bitmap[idx / 8] |= (1 << (idx % 8));
+    }
+    else {
+        bitmap[idx / 8] &= ~(1 << (idx % 8));
+    }
 }

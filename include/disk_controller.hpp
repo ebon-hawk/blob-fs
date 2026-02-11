@@ -40,21 +40,6 @@ public:
     // --- CACHE EVENT HANDLER IMPLEMENTATION ---
     bool onEvict(const int32_t& key, InodeEntry& value) override;
 
-private:
-    // --- DISK I/O ---
-    uint32_t getBlockOffset(int32_t blockIdx) const;
-    uint32_t getInodeOffset(int32_t inodeIdx) const;
-
-    Specs::Inode readInodeFromDisk(int32_t inodeIdx);
-    void writeInodeToDisk(int32_t inodeIdx, const Specs::Inode& node);
-
-    // --- BITMAP MANAGEMENT ---
-    int32_t allocateResource(std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint, bool& dirtyFlag);
-    int32_t findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint);
-    void freeBlock(int32_t blockIdx);
-    void loadBitmaps();
-    void toggleBit(std::vector<uint8_t>& bitmap, int32_t idx, bool set);
-
     // --- FILE GROWTH ---
     bool canGrowFile(const Specs::Inode& node, uint32_t bytesToAdd);
     void extendInode(Specs::Inode& node, uint32_t newTotalSize);
@@ -69,6 +54,21 @@ private:
     void copyIndirectData(int32_t srcIdx, int32_t& destIdx);
     void freeData(Specs::Inode& node);
     void freeIndirectData(int32_t idx);
+
+private:
+    // --- DISK I/O ---
+    uint32_t getBlockOffset(int32_t blockIdx) const;
+    uint32_t getInodeOffset(int32_t inodeIdx) const;
+
+    Specs::Inode readInodeFromDisk(int32_t inodeIdx);
+    void writeInodeToDisk(int32_t inodeIdx, const Specs::Inode& node);
+
+    // --- BITMAP MANAGEMENT ---
+    int32_t allocateResource(std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint, bool& dirtyFlag);
+    int32_t findFreeBit(const std::vector<uint8_t>& bitmap, uint32_t totalCount, uint32_t& hint);
+    void freeBlock(int32_t blockIdx);
+    void loadBitmaps();
+    void toggleBit(std::vector<uint8_t>& bitmap, int32_t idx, bool set);
 
 private:
     static const size_t INODE_CACHE_CAPACITY;
