@@ -17,6 +17,10 @@ public:
     FileSystem(std::fstream& fs, const Specs::Superblock& sb);
     ~FileSystem();
 
+    static Specs::Superblock createFresh(std::fstream& fs, uint64_t maxDiskSize);
+
+    std::string getCurrentPath();
+
     // --- PUBLIC SHELL COMMANDS ---
     void cd(const std::string& path);
     void ls(const std::string& path = "");

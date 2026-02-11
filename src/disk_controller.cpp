@@ -2,6 +2,8 @@
 
 #include "disk_controller.hpp"
 
+const size_t DiskController::INODE_CACHE_CAPACITY = 250;
+
 DiskController::DiskController(std::fstream& fs, const Specs::Superblock& sb)
     : fs(fs), sb(sb), inodeCache(INODE_CACHE_CAPACITY, this) {
     loadBitmaps();
@@ -121,7 +123,7 @@ InodeEntry* DiskController::getInode(int32_t inodeIdx) {
     return inodeCache.put(inodeIdx, { std::move(node), false });
 }
 
-int32_t DiskController::copyInode(int32_t sourceIdx, int32_t parentIdx, const std::string& newName = "") {
+int32_t DiskController::copyInode(int32_t sourceIdx, int32_t parentIdx, const std::string& newName) {
     InodeEntry* src = getInode(sourceIdx);
 
     if (!src) {

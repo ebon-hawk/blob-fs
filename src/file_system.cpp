@@ -21,6 +21,138 @@ FileSystem::~FileSystem() {
     catch (...) {}
 }
 
+Specs::Superblock FileSystem::createFresh(std::fstream& fs, uint64_t maxDiskSize) {
+    if (!fs) {
+        throw std::runtime_error("Invalid file stream.");
+    }
+
+    if (maxDiskSize < sizeof(Specs::Superblock) + Specs::BLOCK_SIZE) {
+        throw std::runtime_error("Disk size too small.");
+    }
+
+    Specs::Superblock sb{};
+    sb.blockSize = Specs::BLOCK_SIZE;
+    sb.magicNumber = Specs::MAGIC_NUMBER;
+    sb.maxDiskSize = maxDiskSize;
+
+    const uint32_t totalBlocksPossible =
+        static_cast<uint32_t>(maxDiskSize / sb.blockSize);
+
+    if (totalBlocksPossible < 8) {
+        throw std::runtime_error("Disk too small for block structure.");
+    }
+
+    // Inode count heuristic (25%)
+    sb.inodeCount = totalBlocksPossible / 4;
+
+    if (sb.inodeCount < 16) {
+        sb.inodeCount = 16;
+    }
+
+    uint64_t offset = sizeof(Specs::Superblock);
+
+    // Inode bitmap
+    sb.inodeBitmapOffset = static_cast<uint32_t>(offset);
+
+    offset += (sb.inodeCount + 7) / 8;
+
+    // Block bitmap
+    sb.blockBitmapOffset = static_cast<uint32_t>(offset);
+
+    offset += (totalBlocksPossible + 7) / 8;
+
+    // Align to 64 bytes (clean boundary)
+    if (offset % 64 != 0) {
+        offset += (64 - (offset % 64));
+    }
+
+    // Inode table
+    sb.inodeTableOffset = static_cast<uint32_t>(offset);
+
+    offset += static_cast<uint64_t>(sb.inodeCount) * sizeof(Specs::Inode);
+
+    // Align to block boundary before data region
+    if (offset % sb.blockSize != 0) {
+        offset += (sb.blockSize - (offset % sb.blockSize));
+    }
+
+    sb.dataRegionOffset = static_cast<uint32_t>(offset);
+
+    if (sb.dataRegionOffset >= maxDiskSize) {
+        throw std::runtime_error("Metadata exceeds disk size.");
+    }
+
+    // Data block count
+    sb.blockCount = static_cast<uint32_t>(
+        (maxDiskSize - sb.dataRegionOffset) / sb.blockSize
+        );
+
+    if (sb.blockCount == 0) {
+        throw std::runtime_error("No usable data blocks.");
+    }
+
+    // Resize physical file
+    fs.seekp(maxDiskSize - 1);
+
+    char zero = 0;
+    fs.write(&zero, 1);
+
+    fs.flush();
+
+    // Zero metadata region only (not full disk)
+    fs.seekp(0);
+
+    const uint64_t metadataSize = sb.dataRegionOffset;
+    std::vector<char> zeroBuf(Specs::BLOCK_SIZE, 0);
+    uint64_t written = 0;
+
+    while (written < metadataSize) {
+        uint64_t chunk = std::min<uint64_t>(zeroBuf.size(), metadataSize - written);
+
+        fs.write(zeroBuf.data(), chunk);
+        written += chunk;
+    }
+
+    // Write superblock
+    fs.seekp(0);
+    fs.write(reinterpret_cast<const char*>(&sb), sizeof(Specs::Superblock));
+
+    // Mark inode 0 as used
+    fs.seekp(sb.inodeBitmapOffset);
+    uint8_t firstByte = 0x01;
+
+    fs.write(reinterpret_cast<char*>(&firstByte), 1);
+
+    // Initialize root inode
+    Specs::Inode root{};
+    root.isDirectory = true;
+    root.size = 0;
+
+    root.parent = Specs::NULL_INDEX;
+
+    root.firstChild = root.nextSibling = root.prevSibling = Specs::NULL_INDEX;
+    std::strncpy(root.name, "/", Specs::MAX_NAME_LEN - 1);
+
+    root.name[Specs::MAX_NAME_LEN - 1] = '\0';
+
+    for (uint32_t i = 0; i < Specs::DIRECT_BLOCKS_COUNT; ++i) {
+        root.directBlocks[i] = Specs::NULL_INDEX;
+    }
+
+    root.indirectBlock = Specs::NULL_INDEX;
+
+    fs.seekp(sb.inodeTableOffset);
+    fs.write(reinterpret_cast<const char*>(&root), sizeof(Specs::Inode));
+
+    fs.flush();
+
+    return sb;
+}
+
+std::string FileSystem::getCurrentPath() {
+    return pathEngine.getFullPath(currentDirIdx);
+}
+
 // --- PUBLIC SHELL COMMANDS ---
 void FileSystem::cd(const std::string& path) {
     if (path.empty()) {
@@ -85,7 +217,7 @@ void FileSystem::ls(const std::string& path) {
 
     std::cout << "TYPE\tSIZE\tNAME\n";
 
-    std::cout << "----\t----\t----\n";
+    std::cout << "------------------------\n";
 
     for (int32_t idx : targets) {
         InodeEntry* entry = controller.getInode(idx);
