@@ -257,6 +257,12 @@ void FileSystem::mkdir(const std::string& path) {
 
     linker.link(newIdx, pIdx);
 
+    Specs::Dentry* cachedDir = dirCache.get(pIdx);
+
+    if (cachedDir) {
+        cachedDir->nameToInode[dirName] = newIdx;
+    }
+
     // Persist the new directory and the link
     controller.sync();
 }
@@ -272,6 +278,7 @@ void FileSystem::rmdir(const std::string& path) {
         throw std::runtime_error("[rmdir] No directories matched the criteria.");
     }
 
+    Specs::Dentry* parentCache = dirCache.get(query.dirIdx);
     size_t removedCount = 0;
 
     for (int32_t idx : targets) {
@@ -301,9 +308,17 @@ void FileSystem::rmdir(const std::string& path) {
             continue;
         }
 
+        std::string nameToDelete = entry->node.name;
+
         linker.unlink(idx);
 
         controller.freeInode(idx);
+
+        if (parentCache) {
+            parentCache->nameToInode.erase(nameToDelete);
+        }
+
+        dirCache.remove(idx);
 
         ++removedCount;
     }
@@ -405,6 +420,10 @@ void FileSystem::cp(const std::string& srcPath, const std::string& destPath) {
         }
 
         linker.link(newIdx, finalParent);
+
+        if (Specs::Dentry* cachedDest = dirCache.get(finalParent)) {
+            cachedDest->nameToInode[finalName] = newIdx;
+        }
     }
 
     controller.sync();
@@ -425,6 +444,7 @@ void FileSystem::rm(const std::string& path) {
         throw std::runtime_error("[rm] No files matched the criteria.");
     }
 
+    Specs::Dentry* cachedDir = dirCache.get(query.dirIdx);
     size_t deletedCount = 0;
 
     for (int32_t idx : targets) {
@@ -444,6 +464,10 @@ void FileSystem::rm(const std::string& path) {
 
         linker.unlink(idx);
 
+        if (cachedDir) {
+            cachedDir->nameToInode.erase(entry->node.name);
+        }
+
         controller.freeInode(idx);
 
         ++deletedCount;
@@ -454,7 +478,6 @@ void FileSystem::rm(const std::string& path) {
     }
 
     if (deletedCount > 0) {
-        // Persist freed bitmaps and unlinked parent blocks
         controller.sync();
     }
 }
@@ -524,17 +547,29 @@ void FileSystem::importFile(const std::string& hostSrc, const std::string& destP
     int32_t inodeIdx = pathEngine.findChildInDirectory(fileName, pIdx);
 
     if (inodeIdx == Specs::NULL_INDEX) {
+        // Standard creation logic
         if (!isValidFilename(fileName)) {
             throw std::runtime_error("[import] Invalid filename.");
         }
 
         inodeIdx = controller.createInode(pIdx, fileName, false);
         linker.link(inodeIdx, pIdx);
+
+        if (Specs::Dentry* cachedDir = dirCache.get(pIdx)) {
+            cachedDir->nameToInode[fileName] = inodeIdx;
+        }
     }
     else if (!append) {
-        throw std::runtime_error("[import] File exists. Use '+append'.");
+        InodeEntry* entry = controller.getInode(inodeIdx);
+
+        if (entry->node.isDirectory) {
+            throw std::runtime_error("[import] Cannot overwrite directory.");
+        }
+
+        controller.freeData(entry->node);
     }
 
+    // Re-fetch entry to get the updated size
     InodeEntry* entry = controller.getInode(inodeIdx);
 
     if (!controller.canGrowFile(entry->node, hostSize)) {
