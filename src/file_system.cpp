@@ -18,7 +18,9 @@ FileSystem::~FileSystem() {
     try {
         controller.sync();
     }
-    catch (...) {}
+    catch (...) {
+        std::cerr << "CRITICAL ERROR: Data loss in FileSystem destructor." << std::endl;
+    }
 }
 
 Specs::Superblock FileSystem::createFresh(std::fstream& fs, uint64_t maxDiskSize) {

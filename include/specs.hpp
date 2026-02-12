@@ -63,6 +63,7 @@ namespace Specs {
 
         int32_t directBlocks[DIRECT_BLOCKS_COUNT];
         int32_t indirectBlock;
+
         uint8_t padding[INODE_PADDING_SIZE];
     };
 

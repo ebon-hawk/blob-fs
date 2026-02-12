@@ -1,3 +1,4 @@
+#include <iostream>
 #include <stdexcept>
 
 #include "disk_controller.hpp"
@@ -13,45 +14,46 @@ DiskController::~DiskController() {
     try {
         sync();
     }
-    catch (...) {}
+    catch (...) {
+        std::cerr << "CRITICAL ERROR: Data loss in DiskController destructor." << std::endl;
+    }
 }
 
 // --- PERSISTENCE CONTROL ---
 void DiskController::sync() {
-    if (inodeBitmapDirty) {
-        fs.seekp(sb.inodeBitmapOffset, std::ios::beg);
-        fs.write(reinterpret_cast<const char*>(inodeBitmap.data()), inodeBitmap.size());
-
-        if (!fs) {
-            throw std::runtime_error("Failed to sync inode bitmap.");
-        }
-
-        inodeBitmapDirty = false;
+    if (!blockBitmapDirty && !inodeBitmapDirty) {
+        return;
     }
 
-    if (blockBitmapDirty) {
-        fs.seekp(sb.blockBitmapOffset, std::ios::beg);
-        fs.write(reinterpret_cast<const char*>(blockBitmap.data()), blockBitmap.size());
-
-        if (!fs) {
-            throw std::runtime_error("Failed to sync block bitmap.");
+    try {
+        if (blockBitmapDirty) {
+            fs.seekp(sb.blockBitmapOffset, std::ios::beg);
+            fs.write(reinterpret_cast<const char*>(blockBitmap.data()), blockBitmap.size());
         }
 
+        if (inodeBitmapDirty) {
+            fs.seekp(sb.inodeBitmapOffset, std::ios::beg);
+            fs.write(reinterpret_cast<const char*>(inodeBitmap.data()), inodeBitmap.size());
+        }
+
+        syncInodeCache();
+
+        // Push buffer to physical disk
+        fs.flush();
+
+        if (!fs) {
+            throw std::runtime_error("Critical failure: fs.flush() failed.");
+        }
+
+        // Flags are only cleared if we get here successfully
         blockBitmapDirty = false;
+        inodeBitmapDirty = false;
+
+        clearInodeCacheDirtyFlags();
     }
-
-    inodeCache.forEach([this](int32_t key, InodeEntry& entry) {
-        if (entry.dirty) {
-            writeInodeToDisk(key, entry.node);
-
-            entry.dirty = false;
-        }
-        });
-
-    fs.flush();
-
-    if (!fs) {
-        throw std::runtime_error("Failed to flush file system.");
+    catch (...) {
+        // We don't clear flags here (the controller stays "dirty")
+        throw;
     }
 }
 
@@ -475,6 +477,26 @@ void DiskController::freeIndirectData(int32_t idx) {
     }
 
     freeBlock(idx);
+}
+
+void DiskController::clearInodeCacheDirtyFlags() {
+    inodeCache.forEach([](int32_t key, InodeEntry& entry) {
+        entry.dirty = false;
+        });
+}
+
+void DiskController::syncInodeCache() {
+    inodeCache.forEach([this](int32_t key, InodeEntry& entry) {
+        if (entry.dirty) {
+            // Write to the file stream buffer
+            writeInodeToDisk(key, entry.node);
+
+            // Check if the stream failed during any of these writes
+            if (!fs) {
+                throw std::runtime_error("Failed to write inode to disk.");
+            }
+        }
+        });
 }
 
 // --- DISK I/O ---

@@ -56,6 +56,9 @@ public:
     void freeIndirectData(int32_t idx);
 
 private:
+    void clearInodeCacheDirtyFlags();
+    void syncInodeCache();
+
     // --- DISK I/O ---
     uint32_t getBlockOffset(int32_t blockIdx) const;
     uint32_t getInodeOffset(int32_t inodeIdx) const;
