@@ -14,8 +14,13 @@
 
 class FileSystem {
 public:
+    FileSystem(FileSystem&& other) noexcept = delete;
+    FileSystem(const FileSystem& other) = delete;
     FileSystem(std::fstream& fs, const Specs::Superblock& sb);
     ~FileSystem();
+
+    FileSystem& operator=(FileSystem&& other) noexcept = delete;
+    FileSystem& operator=(const FileSystem& other) = delete;
 
     static Specs::Superblock createFresh(std::fstream& fs, uint64_t maxDiskSize);
 

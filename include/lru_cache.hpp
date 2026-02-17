@@ -8,7 +8,13 @@
 template <typename Key, typename Value>
 class ICacheEventHandler {
 public:
-    virtual ~ICacheEventHandler() {}
+    ICacheEventHandler() = default;
+    ICacheEventHandler(ICacheEventHandler&& other) noexcept = default;
+    ICacheEventHandler(const ICacheEventHandler& other) = delete;
+    virtual ~ICacheEventHandler() = default;
+
+    ICacheEventHandler& operator=(ICacheEventHandler&& other) noexcept = default;
+    ICacheEventHandler& operator=(const ICacheEventHandler& other) = delete;
 
     // Called when an item is being removed from memory
     virtual bool onEvict(const Key& key, Value& value) = 0;
@@ -22,6 +28,13 @@ public:
         if (capacity == 0)
             throw std::invalid_argument("Cache capacity must be a positive value.");
     }
+
+    LRUCache(LRUCache&& other) noexcept = default;
+    LRUCache(const LRUCache& other) = delete;
+    ~LRUCache() = default;
+
+    LRUCache& operator=(LRUCache&& other) noexcept = default;
+    LRUCache& operator=(const LRUCache& other) = delete;
 
     size_t size() const { return cacheMap.size(); }
 

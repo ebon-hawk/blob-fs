@@ -16,8 +16,13 @@ struct InodeEntry {
 
 class DiskController : public ICacheEventHandler<int32_t, InodeEntry> {
 public:
+    DiskController(DiskController&& other) noexcept = delete;
+    DiskController(const DiskController& other) = delete;
     DiskController(std::fstream& fs, const Specs::Superblock& sb);
     virtual ~DiskController();
+
+    DiskController& operator=(DiskController&& other) noexcept = delete;
+    DiskController& operator=(const DiskController& other) = delete;
 
     // --- PERSISTENCE CONTROL ---
     void sync();

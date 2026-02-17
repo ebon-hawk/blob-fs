@@ -8,6 +8,12 @@
 class InodeLinker {
 public:
     InodeLinker(DiskController& controller, LRUCache<int32_t, Specs::Dentry>& dirCache);
+    InodeLinker(InodeLinker&& other) noexcept = default;
+    InodeLinker(const InodeLinker& other) = delete;
+    ~InodeLinker() = default;
+
+    InodeLinker& operator=(InodeLinker&& other) = delete;
+    InodeLinker& operator=(const InodeLinker& other) = delete;
 
     bool isDirectoryEmpty(int32_t dirIdx);
     void deleteRecursive(int32_t inodeIdx);

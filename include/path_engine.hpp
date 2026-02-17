@@ -11,6 +11,12 @@
 class PathEngine {
 public:
     PathEngine(DiskController& controller, LRUCache<int32_t, Specs::Dentry>& dirCache);
+    PathEngine(PathEngine&& other) noexcept = default;
+    PathEngine(const PathEngine& other) = delete;
+    ~PathEngine() = default;
+
+    PathEngine& operator=(PathEngine&& other) noexcept = delete;
+    PathEngine& operator=(const PathEngine& other) = delete;
 
     // Specialized for commands that support wildcards
     Specs::PathQuery parsePathQuery(const std::string& path, int32_t currentDirIdx);
