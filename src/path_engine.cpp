@@ -128,21 +128,26 @@ std::string PathEngine::getFullPath(int32_t inodeIdx) {
     }
 
     int32_t curr = inodeIdx;
-    std::string path = "";
+    std::vector<std::string> parts;
 
     while (curr != 0 && curr != Specs::NULL_INDEX) {
         InodeEntry* entry = controller.getInode(curr);
 
         if (!entry) break;
 
-        // Build path backwards
-        path = "/" + std::string(entry->node.name) + path;
+        parts.push_back(std::string(entry->node.name));
 
         // Move to parent
         curr = entry->node.parent;
     }
 
-    return path.empty() ? "/" : path;
+    std::string fullPath = "";
+
+    for (int i = parts.size() - 1; i >= 0; --i) {
+        fullPath += "/" + parts[i];
+    }
+
+    return fullPath.empty() ? "/" : fullPath;
 }
 
 std::vector<int32_t> PathEngine::findAllMatches(const std::string& pattern, int32_t dirIdx) {
